@@ -7,12 +7,14 @@ go_library(
         "debugger_darwin.go",
         "debugger_freebsd.go",
         "debugger_linux.go",
+        "debugger_unix.go",
         "debugger_windows.go",
         "locations.go",
     ],
     importpath = "github.com/go-delve/delve/service/debugger",
     visibility = ["//visibility:public"],
     deps = [
+        "//pkg/dwarf/op:go_default_library",
         "//pkg/goversion:go_default_library",
         "//pkg/logflags:go_default_library",
         "//pkg/proc:go_default_library",
@@ -43,6 +45,15 @@ go_library(
 
 go_test(
     name = "go_default_test",
-    srcs = ["locations_test.go"],
+    srcs = [
+        "debugger_test.go",
+        "debugger_unix_test.go",
+        "locations_test.go",
+    ],
     embed = [":go_default_library"],
+    deps = [
+        "//pkg/gobuild:go_default_library",
+        "//pkg/proc/test:go_default_library",
+        "//service/api:go_default_library",
+    ],
 )

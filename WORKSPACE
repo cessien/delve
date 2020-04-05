@@ -41,8 +41,8 @@ go_repository(
 go_repository(
     name = "com_github_cpuguy83_go_md2man",
     importpath = "github.com/cpuguy83/go-md2man",
-    sum = "h1:DwoNytLphI8hzS2Af4D0dfaEaiSq2bN05mEm4R6vf8M=",
-    version = "v1.0.8",
+    sum = "h1:BSKMNlYxDvnunlTymqtgONjNnaRV1sTpcovwwjF22jk=",
+    version = "v1.0.10",
 )
 
 go_repository(
@@ -153,8 +153,8 @@ go_repository(
 go_repository(
     name = "com_github_russross_blackfriday",
     importpath = "github.com/russross/blackfriday",
-    sum = "h1:g9ZlAHmkc/h5So+OjNCkZWh+FjuKEOOOoyRkqlGA8+c=",
-    version = "v0.0.0-20180428102519-11635eb403ff",
+    sum = "h1:HyvC0ARfnZBqnXwABFeSZHpKvJHJJfPz81GNueLj0oo=",
+    version = "v1.5.2",
 )
 
 go_repository(
@@ -202,8 +202,8 @@ go_repository(
 go_repository(
     name = "in_gopkg_check_v1",
     importpath = "gopkg.in/check.v1",
-    sum = "h1:qIbj1fsPNlZgppZ+VLlY7N33q108Sa+fhmuc+sWQYwY=",
-    version = "v1.0.0-20180628173108-788fd7840127",
+    sum = "h1:yhCVgyC4o1eVCa2tZl7eS0r+SDo693bJlVdllGtEeKM=",
+    version = "v0.0.0-20161208181325-20d25e280405",
 )
 
 go_repository(
@@ -302,4 +302,18 @@ go_repository(
     importpath = "golang.org/x/xerrors",
     sum = "h1:9zdDQZ7Thm29KFXgAX/+yaf3eVbP7djjWp/dXAppNCc=",
     version = "v0.0.0-20190717185122-a985d3407aa7",
+)
+
+go_repository(
+    name = "com_github_google_go_dap",
+    importpath = "github.com/google/go-dap",
+    sum = "h1:whjIGQRumwbR40qRU7CEKuFLmePUUc2s4Nt9DoXXxWk=",
+    version = "v0.2.0",
+)
+
+go_repository(
+    name = "com_github_hashicorp_golang_lru",
+    importpath = "github.com/hashicorp/golang-lru",
+    sum = "h1:YDjusn29QI/Das2iO9M0BHnIbxPeyuCHsjMW+lJfyTc=",
+    version = "v0.5.4",
 )

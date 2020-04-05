@@ -8,6 +8,7 @@ go_library(
         "dynamic.go",
         "regs_amd64_arch.go",
         "regs_arm64_arch.go",
+        "regs_i386_arch.go",
     ],
     importpath = "github.com/go-delve/delve/pkg/proc/linutil",
     visibility = ["//visibility:public"],

@@ -5,11 +5,13 @@ go_library(
     srcs = [
         "gen-opcodes.go",
         "gen-starlark-bindings.go",
+        "gen-travis.go",
         "make.go",
     ],
-    importpath = "github.com/go-delve/delve/scripts",
+    importpath = "github.com/go-delve/delve/_scripts",
     visibility = ["//visibility:private"],
     deps = [
+        "//pkg/goversion:go_default_library",
         "//vendor/github.com/spf13/cobra:go_default_library",
         "//vendor/golang.org/x/tools/go/packages:go_default_library",
     ],

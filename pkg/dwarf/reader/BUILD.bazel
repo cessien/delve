@@ -8,5 +8,8 @@ go_library(
     ],
     importpath = "github.com/go-delve/delve/pkg/dwarf/reader",
     visibility = ["//visibility:public"],
-    deps = ["//pkg/dwarf/op:go_default_library"],
+    deps = [
+        "//pkg/dwarf/godwarf:go_default_library",
+        "//pkg/dwarf/op:go_default_library",
+    ],
 )

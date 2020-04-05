@@ -4,7 +4,7 @@ go_library(
     name = "go_default_library",
     srcs = [
         "core.go",
-        "linux_amd64_core.go",
+        "linux_core.go",
         "windows_amd64_minidump.go",
     ],
     importpath = "github.com/go-delve/delve/pkg/proc/core",

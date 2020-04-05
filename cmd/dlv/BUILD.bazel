@@ -25,6 +25,7 @@ go_test(
     deps = [
         "//pkg/proc/test:go_default_library",
         "//pkg/terminal:go_default_library",
+        "//service/dap/daptest:go_default_library",
         "//service/rpc2:go_default_library",
         "//vendor/golang.org/x/tools/go/packages:go_default_library",
     ],
