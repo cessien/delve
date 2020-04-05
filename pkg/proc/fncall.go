@@ -90,7 +90,7 @@ type functionCallState struct {
 }
 
 type callContext struct {
-	p Process
+	p *Target
 
 	// checkEscape is true if the escape check should be performed.
 	// See service/api.DebuggerCommand.UnsafeCall in service/api/types.go.
@@ -115,6 +115,14 @@ type continueRequest struct {
 	ret  *Variable
 }
 
+type callInjection struct {
+	// if continueCompleted is not nil it means we are in the process of
+	// executing an injected function call, see comments throughout
+	// pkg/proc/fncall.go for a description of how this works.
+	continueCompleted chan<- *G
+	continueRequest   <-chan continueRequest
+}
+
 func (callCtx *callContext) doContinue() *G {
 	callCtx.continueRequest <- continueRequest{cont: true}
 	return <-callCtx.continueCompleted
@@ -130,9 +138,9 @@ func (callCtx *callContext) doReturn(ret *Variable, err error) {
 // EvalExpressionWithCalls is like EvalExpression but allows function calls in 'expr'.
 // Because this can only be done in the current goroutine, unlike
 // EvalExpression, EvalExpressionWithCalls is not a method of EvalScope.
-func EvalExpressionWithCalls(p Process, g *G, expr string, retLoadCfg LoadConfig, checkEscape bool) error {
-	bi := p.BinInfo()
-	if !p.Common().fncallEnabled {
+func EvalExpressionWithCalls(t *Target, g *G, expr string, retLoadCfg LoadConfig, checkEscape bool) error {
+	bi := t.BinInfo()
+	if !t.SupportsFunctionCalls() {
 		return errFuncCallUnsupportedBackend
 	}
 
@@ -144,7 +152,7 @@ func EvalExpressionWithCalls(p Process, g *G, expr string, retLoadCfg LoadConfig
 		return errGoroutineNotRunning
 	}
 
-	if callinj := p.Common().fncallForG[g.ID]; callinj != nil && callinj.continueCompleted != nil {
+	if callinj := t.fncallForG[g.ID]; callinj != nil && callinj.continueCompleted != nil {
 		return errFuncCallInProgress
 	}
 
@@ -162,14 +170,14 @@ func EvalExpressionWithCalls(p Process, g *G, expr string, retLoadCfg LoadConfig
 	continueCompleted := make(chan *G)
 
 	scope.callCtx = &callContext{
-		p:                 p,
+		p:                 t,
 		checkEscape:       checkEscape,
 		retLoadCfg:        retLoadCfg,
 		continueRequest:   continueRequest,
 		continueCompleted: continueCompleted,
 	}
 
-	p.Common().fncallForG[g.ID] = &callInjection{
+	t.fncallForG[g.ID] = &callInjection{
 		continueCompleted,
 		continueRequest,
 	}
@@ -178,13 +186,13 @@ func EvalExpressionWithCalls(p Process, g *G, expr string, retLoadCfg LoadConfig
 
 	contReq, ok := <-continueRequest
 	if contReq.cont {
-		return Continue(p)
+		return t.Continue()
 	}
 
-	return finishEvalExpressionWithCalls(p, g, contReq, ok)
+	return finishEvalExpressionWithCalls(t, g, contReq, ok)
 }
 
-func finishEvalExpressionWithCalls(p Process, g *G, contReq continueRequest, ok bool) error {
+func finishEvalExpressionWithCalls(t *Target, g *G, contReq continueRequest, ok bool) error {
 	fncallLog("stashing return values for %d in thread=%d\n", g.ID, g.Thread.ThreadID())
 	var err error
 	if !ok {
@@ -208,8 +216,8 @@ func finishEvalExpressionWithCalls(p Process, g *G, contReq continueRequest, ok 
 		g.Thread.Common().returnValues = []*Variable{contReq.ret}
 	}
 
-	close(p.Common().fncallForG[g.ID].continueCompleted)
-	delete(p.Common().fncallForG, g.ID)
+	close(t.fncallForG[g.ID].continueCompleted)
+	delete(t.fncallForG, g.ID)
 	return err
 }
 
@@ -234,7 +242,7 @@ func evalFunctionCall(scope *EvalScope, node *ast.CallExpr) (*Variable, error) {
 
 	p := scope.callCtx.p
 	bi := scope.BinInfo
-	if !p.Common().fncallEnabled {
+	if !p.SupportsFunctionCalls() {
 		return nil, errFuncCallUnsupportedBackend
 	}
 
@@ -429,7 +437,12 @@ func funcCallEvalFuncExpr(scope *EvalScope, fncall *functionCallState, allowCall
 
 	argnum := len(fncall.expr.Args)
 
-	if len(fnvar.Children) > 0 {
+	// If the function variable has a child then that child is the method
+	// receiver. However, if the method receiver is not being used (e.g.
+	// func (_ X) Foo()) then it will not actually be listed as a formal
+	// argument. Ensure that we are really off by 1 to add the receiver to
+	// the function call.
+	if len(fnvar.Children) > 0 && argnum == (len(fncall.formalArgs)-1) {
 		argnum++
 		fncall.receiver = &fnvar.Children[0]
 		fncall.receiver.Name = exprToString(fncall.expr.Fun)
@@ -507,17 +520,22 @@ func funcCallCopyOneArg(scope *EvalScope, fncall *functionCallState, actualArg *
 
 func funcCallArgs(fn *Function, bi *BinaryInfo, includeRet bool) (argFrameSize int64, formalArgs []funcCallArg, err error) {
 	const CFA = 0x1000
-	vrdr := reader.Variables(fn.cu.image.dwarf, fn.offset, reader.ToRelAddr(fn.Entry, fn.cu.image.StaticBase), int(^uint(0)>>1), false, true)
+
+	dwarfTree, err := fn.cu.image.getDwarfTree(fn.offset)
+	if err != nil {
+		return 0, nil, fmt.Errorf("DWARF read error: %v", err)
+	}
+
+	varEntries := reader.Variables(dwarfTree, fn.Entry, int(^uint(0)>>1), false, true)
 
 	trustArgOrder := bi.Producer() != "" && goversion.ProducerAfterOrEqual(bi.Producer(), 1, 12)
 
 	// typechecks arguments, calculates argument frame size
-	for vrdr.Next() {
-		e := vrdr.Entry()
-		if e.Tag != dwarf.TagFormalParameter {
+	for _, entry := range varEntries {
+		if entry.Tag != dwarf.TagFormalParameter {
 			continue
 		}
-		entry, argname, typ, err := readVarEntry(e, fn.cu.image)
+		argname, typ, err := readVarEntry(entry.Tree, fn.cu.image)
 		if err != nil {
 			return 0, nil, err
 		}
@@ -529,7 +547,7 @@ func funcCallArgs(fn *Function, bi *BinaryInfo, includeRet bool) (argFrameSize i
 			err = fmt.Errorf("could not get argument location of %s: %v", argname, err)
 		} else {
 			var pieces []op.Piece
-			off, pieces, err = op.ExecuteStackProgram(op.DwarfRegisters{CFA: CFA, FrameBase: CFA}, locprog)
+			off, pieces, err = op.ExecuteStackProgram(op.DwarfRegisters{CFA: CFA, FrameBase: CFA}, locprog, bi.Arch.PtrSize())
 			if err != nil {
 				err = fmt.Errorf("unsupported location expression for argument %s: %v", argname, err)
 			}
@@ -560,9 +578,6 @@ func funcCallArgs(fn *Function, bi *BinaryInfo, includeRet bool) (argFrameSize i
 		if isret, _ := entry.Val(dwarf.AttrVarParam).(bool); !isret || includeRet {
 			formalArgs = append(formalArgs, funcCallArg{name: argname, typ: typ, off: off, isret: isret})
 		}
-	}
-	if err := vrdr.Err(); err != nil {
-		return 0, nil, fmt.Errorf("DWARF read error: %v", err)
 	}
 
 	sort.Slice(formalArgs, func(i, j int) bool {
@@ -879,8 +894,8 @@ func isCallInjectionStop(loc *Location) bool {
 // callInjectionProtocol is the function called from Continue to progress
 // the injection protocol for all threads.
 // Returns true if a call injection terminated
-func callInjectionProtocol(p Process, threads []Thread) (done bool, err error) {
-	if len(p.Common().fncallForG) == 0 {
+func callInjectionProtocol(t *Target, threads []Thread) (done bool, err error) {
+	if len(t.fncallForG) == 0 {
 		// we aren't injecting any calls, no need to check the threads.
 		return false, nil
 	}
@@ -897,7 +912,7 @@ func callInjectionProtocol(p Process, threads []Thread) (done bool, err error) {
 		if err != nil {
 			return done, fmt.Errorf("could not determine running goroutine for thread %#x currently executing the function call injection protocol: %v", thread.ThreadID(), err)
 		}
-		callinj := p.Common().fncallForG[g.ID]
+		callinj := t.fncallForG[g.ID]
 		if callinj == nil || callinj.continueCompleted == nil {
 			return false, fmt.Errorf("could not recover call injection state for goroutine %d", g.ID)
 		}
@@ -905,7 +920,7 @@ func callInjectionProtocol(p Process, threads []Thread) (done bool, err error) {
 		callinj.continueCompleted <- g
 		contReq, ok := <-callinj.continueRequest
 		if !contReq.cont {
-			err := finishEvalExpressionWithCalls(p, g, contReq, ok)
+			err := finishEvalExpressionWithCalls(t, g, contReq, ok)
 			if err != nil {
 				return done, err
 			}

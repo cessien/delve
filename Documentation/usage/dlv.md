@@ -30,6 +30,7 @@ Pass flags to the program you are debugging using `--`, for example:
       --log                  Enable debugging server logging.
       --log-dest string      Writes logs to the specified file or file descriptor (see 'dlv help log').
       --log-output string    Comma separated list of components that should produce debug output (see 'dlv help log')
+      --only-same-user       Only connections from the same user that started this instance of Delve are allowed to connect. (default true)
       --wd string            Working directory for running the program. (default ".")
 ```
 
@@ -37,6 +38,7 @@ Pass flags to the program you are debugging using `--`, for example:
 * [dlv attach](dlv_attach.md)	 - Attach to running process and begin debugging.
 * [dlv connect](dlv_connect.md)	 - Connect to a headless debug server.
 * [dlv core](dlv_core.md)	 - Examine a core dump.
+* [dlv dap](dlv_dap.md)	 - [EXPERIMENTAL] Starts a TCP server communicating via Debug Adaptor Protocol (DAP).
 * [dlv debug](dlv_debug.md)	 - Compile and begin debugging main package in current directory, or the package specified.
 * [dlv exec](dlv_exec.md)	 - Execute a precompiled binary, and begin a debug session.
 * [dlv replay](dlv_replay.md)	 - Replays a rr trace.

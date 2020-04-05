@@ -5,7 +5,6 @@ package native
 // #include "threads_darwin.h"
 import "C"
 import (
-	"encoding/binary"
 	"errors"
 	"fmt"
 	"unsafe"
@@ -73,9 +72,9 @@ func (r *Regs) Slice(floatingPoint bool) []proc.Register {
 	out := make([]proc.Register, 0, len(regs)+len(r.fpregs))
 	for _, reg := range regs {
 		if reg.k == "Rflags" {
-			out = proc.AppendEflagReg(out, reg.k, reg.v)
+			out = proc.AppendUint64Register(out, reg.k, reg.v)
 		} else {
-			out = proc.AppendQwordReg(out, reg.k, reg.v)
+			out = proc.AppendUint64Register(out, reg.k, reg.v)
 		}
 	}
 	if floatingPoint {
@@ -100,11 +99,6 @@ func (r *Regs) BP() uint64 {
 	return r.rbp
 }
 
-// CX returns the value of the RCX register.
-func (r *Regs) CX() uint64 {
-	return r.rcx
-}
-
 // TLS returns the value of the register
 // that contains the location of the thread
 // local storage segment.
@@ -117,7 +111,7 @@ func (r *Regs) GAddr() (uint64, bool) {
 }
 
 // SetPC sets the RIP register to the value specified by `pc`.
-func (thread *Thread) SetPC(pc uint64) error {
+func (thread *nativeThread) SetPC(pc uint64) error {
 	kret := C.set_pc(thread.os.threadAct, C.uint64_t(pc))
 	if kret != C.KERN_SUCCESS {
 		return fmt.Errorf("could not set pc")
@@ -126,11 +120,11 @@ func (thread *Thread) SetPC(pc uint64) error {
 }
 
 // SetSP sets the RSP register to the value specified by `pc`.
-func (thread *Thread) SetSP(sp uint64) error {
+func (thread *nativeThread) SetSP(sp uint64) error {
 	return errors.New("not implemented")
 }
 
-func (thread *Thread) SetDX(dx uint64) error {
+func (thread *nativeThread) SetDX(dx uint64) error {
 	return errors.New("not implemented")
 }
 
@@ -291,7 +285,7 @@ func (r *Regs) Get(n int) (uint64, error) {
 	return 0, proc.ErrUnknownRegister
 }
 
-func registers(thread *Thread, floatingPoint bool) (proc.Registers, error) {
+func registers(thread *nativeThread, floatingPoint bool) (proc.Registers, error) {
 	var state C.x86_thread_state64_t
 	var identity C.thread_identifier_info_data_t
 	kret := C.get_registers(C.mach_port_name_t(thread.os.threadAct), &state)
@@ -347,25 +341,23 @@ func registers(thread *Thread, floatingPoint bool) (proc.Registers, error) {
 			return nil, fmt.Errorf("could not get floating point registers")
 		}
 
-		regs.fpregs = proc.AppendWordReg(regs.fpregs, "CW", *((*uint16)(unsafe.Pointer(&fpstate.__fpu_fcw))))
-		regs.fpregs = proc.AppendWordReg(regs.fpregs, "SW", *((*uint16)(unsafe.Pointer(&fpstate.__fpu_fsw))))
-		regs.fpregs = proc.AppendWordReg(regs.fpregs, "TW", uint16(fpstate.__fpu_ftw))
-		regs.fpregs = proc.AppendWordReg(regs.fpregs, "FOP", uint16(fpstate.__fpu_fop))
-		regs.fpregs = proc.AppendQwordReg(regs.fpregs, "FIP", uint64(fpstate.__fpu_cs)<<32|uint64(fpstate.__fpu_ip))
-		regs.fpregs = proc.AppendQwordReg(regs.fpregs, "FDP", uint64(fpstate.__fpu_ds)<<32|uint64(fpstate.__fpu_dp))
+		regs.fpregs = proc.AppendUint64Register(regs.fpregs, "CW", uint64(*((*uint16)(unsafe.Pointer(&fpstate.__fpu_fcw)))))
+		regs.fpregs = proc.AppendUint64Register(regs.fpregs, "SW", uint64(*((*uint16)(unsafe.Pointer(&fpstate.__fpu_fsw)))))
+		regs.fpregs = proc.AppendUint64Register(regs.fpregs, "TW", uint64(fpstate.__fpu_ftw))
+		regs.fpregs = proc.AppendUint64Register(regs.fpregs, "FOP", uint64(fpstate.__fpu_fop))
+		regs.fpregs = proc.AppendUint64Register(regs.fpregs, "FIP", uint64(fpstate.__fpu_cs)<<32|uint64(fpstate.__fpu_ip))
+		regs.fpregs = proc.AppendUint64Register(regs.fpregs, "FDP", uint64(fpstate.__fpu_ds)<<32|uint64(fpstate.__fpu_dp))
 
 		for i, st := range []*C.char{&fpstate.__fpu_stmm0.__mmst_reg[0], &fpstate.__fpu_stmm1.__mmst_reg[0], &fpstate.__fpu_stmm2.__mmst_reg[0], &fpstate.__fpu_stmm3.__mmst_reg[0], &fpstate.__fpu_stmm4.__mmst_reg[0], &fpstate.__fpu_stmm5.__mmst_reg[0], &fpstate.__fpu_stmm6.__mmst_reg[0], &fpstate.__fpu_stmm7.__mmst_reg[0]} {
 			stb := C.GoBytes(unsafe.Pointer(st), 10)
-			mantissa := binary.LittleEndian.Uint64(stb[:8])
-			exponent := binary.LittleEndian.Uint16(stb[8:])
-			regs.fpregs = proc.AppendX87Reg(regs.fpregs, i, exponent, mantissa)
+			regs.fpregs = proc.AppendBytesRegister(regs.fpregs, fmt.Sprintf("ST(%d)", i), stb)
 		}
 
-		regs.fpregs = proc.AppendMxcsrReg(regs.fpregs, "MXCSR", uint64(fpstate.__fpu_mxcsr))
-		regs.fpregs = proc.AppendDwordReg(regs.fpregs, "MXCSR_MASK", uint32(fpstate.__fpu_mxcsrmask))
+		regs.fpregs = proc.AppendUint64Register(regs.fpregs, "MXCSR", uint64(fpstate.__fpu_mxcsr))
+		regs.fpregs = proc.AppendUint64Register(regs.fpregs, "MXCSR_MASK", uint64(fpstate.__fpu_mxcsrmask))
 
 		for i, xmm := range []*C.char{&fpstate.__fpu_xmm0.__xmm_reg[0], &fpstate.__fpu_xmm1.__xmm_reg[0], &fpstate.__fpu_xmm2.__xmm_reg[0], &fpstate.__fpu_xmm3.__xmm_reg[0], &fpstate.__fpu_xmm4.__xmm_reg[0], &fpstate.__fpu_xmm5.__xmm_reg[0], &fpstate.__fpu_xmm6.__xmm_reg[0], &fpstate.__fpu_xmm7.__xmm_reg[0], &fpstate.__fpu_xmm8.__xmm_reg[0], &fpstate.__fpu_xmm9.__xmm_reg[0], &fpstate.__fpu_xmm10.__xmm_reg[0], &fpstate.__fpu_xmm11.__xmm_reg[0], &fpstate.__fpu_xmm12.__xmm_reg[0], &fpstate.__fpu_xmm13.__xmm_reg[0], &fpstate.__fpu_xmm14.__xmm_reg[0], &fpstate.__fpu_xmm15.__xmm_reg[0]} {
-			regs.fpregs = proc.AppendSSEReg(regs.fpregs, fmt.Sprintf("XMM%d", i), C.GoBytes(unsafe.Pointer(xmm), 16))
+			regs.fpregs = proc.AppendBytesRegister(regs.fpregs, fmt.Sprintf("XMM%d", i), C.GoBytes(unsafe.Pointer(xmm), 16))
 		}
 	}
 	return regs, nil

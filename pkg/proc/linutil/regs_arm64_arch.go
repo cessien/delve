@@ -16,7 +16,7 @@ type ARM64Registers struct {
 
 // ARM64PtraceRegs is the struct used by the linux kernel to return the
 // general purpose registers for ARM64 CPUs.
-//copy form sys/unix/ztypes_linux_arm64.go:735
+// copy from sys/unix/ztypes_linux_arm64.go:735
 type ARM64PtraceRegs struct {
 	Regs   [31]uint64
 	Sp     uint64
@@ -67,7 +67,7 @@ func (r *ARM64Registers) Slice(floatingPoint bool) []proc.Register {
 	}
 	out := make([]proc.Register, 0, len(regs64)+len(r.Fpregs))
 	for _, reg := range regs64 {
-		out = proc.AppendQwordReg(out, reg.k, reg.v)
+		out = proc.AppendUint64Register(out, reg.k, reg.v)
 	}
 	out = append(out, r.Fpregs...)
 	return out
@@ -87,11 +87,6 @@ func (r *ARM64Registers) BP() uint64 {
 	return r.Regs.Regs[29]
 }
 
-// CX returns the value of RCX register.
-func (r *ARM64Registers) CX() uint64 {
-	return 0
-}
-
 // TLS returns the address of the thread local storage memory segment.
 func (r *ARM64Registers) TLS() uint64 {
 	return 0
@@ -103,7 +98,7 @@ func (r *ARM64Registers) GAddr() (uint64, bool) {
 	return r.Regs.Regs[28], true
 }
 
-// Get returns the value of the n-th register (in x86asm order).
+// Get returns the value of the n-th register (in arm64asm order).
 func (r *ARM64Registers) Get(n int) (uint64, error) {
 	reg := arm64asm.Reg(n)
 
@@ -130,10 +125,22 @@ func (r *ARM64Registers) Copy() proc.Registers {
 	return &rr
 }
 
-// Decode decodes an XSAVE area to a list of name/value pairs of registers.
-func Decode(fpregs []byte) (regs []proc.Register) {
-	for i := 0; i < len(fpregs); i += 16 {
-		regs = proc.AppendFPReg(regs, fmt.Sprintf("V%d", i/16), fpregs[i:i+16])
+type ARM64PtraceFpRegs struct {
+	Vregs []byte
+	Fpsr  uint32
+	Fpcr  uint32
+}
+
+const _ARM_FP_REGS_LENGTH = 512
+
+func (fpregs *ARM64PtraceFpRegs) Decode() (regs []proc.Register) {
+	for i := 0; i < len(fpregs.Vregs); i += 16 {
+		regs = proc.AppendBytesRegister(regs, fmt.Sprintf("V%d", i/16), fpregs.Vregs[i:i+16])
 	}
 	return
+}
+
+func (fpregs *ARM64PtraceFpRegs) Byte() []byte {
+	fpregs.Vregs = make([]byte, _ARM_FP_REGS_LENGTH)
+	return fpregs.Vregs[:]
 }

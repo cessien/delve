@@ -134,10 +134,10 @@ func TestSplicedReader(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			mem := &SplicedMemory{}
+			mem := &splicedMemory{}
 			for _, region := range test.regions {
 				r := bytes.NewReader(region.data)
-				mem.Add(&OffsetReaderAt{r, 0}, region.off, region.length)
+				mem.Add(&offsetReaderAt{r, 0}, region.off, region.length)
 			}
 			got := make([]byte, test.readLen)
 			n, err := mem.ReadMemory(got, test.readAddr)
@@ -148,7 +148,7 @@ func TestSplicedReader(t *testing.T) {
 	}
 }
 
-func withCoreFile(t *testing.T, name, args string) *Process {
+func withCoreFile(t *testing.T, name, args string) *proc.Target {
 	// This is all very fragile and won't work on hosts with non-default core patterns.
 	// Might be better to check in the binary and core?
 	tempDir, err := ioutil.TempDir("", "")
@@ -183,6 +183,17 @@ func withCoreFile(t *testing.T, name, args string) *Process {
 		t.Fatalf("previous errors")
 	}
 	return p
+}
+
+func logRegisters(t *testing.T, regs proc.Registers, arch *proc.Arch) {
+	dregs := arch.RegistersToDwarfRegisters(0, regs)
+	for i, reg := range dregs.Regs {
+		if reg == nil {
+			continue
+		}
+		name, _, value := arch.DwarfRegisterToString(i, reg)
+		t.Logf("%s = %s", name, value)
+	}
 }
 
 func TestCore(t *testing.T) {
@@ -243,10 +254,7 @@ func TestCore(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Couldn't get current thread registers: %v", err)
 	}
-	regslice := regs.Slice(true)
-	for _, reg := range regslice {
-		t.Logf("%s = %s", reg.Name, reg.Value)
-	}
+	logRegisters(t, regs, p.BinInfo().Arch)
 }
 
 func TestCoreFpRegisters(t *testing.T) {
@@ -255,7 +263,7 @@ func TestCoreFpRegisters(t *testing.T) {
 	}
 	// in go1.10 the crash is executed on a different thread and registers are
 	// no longer available in the core dump.
-	if ver, _ := goversion.Parse(runtime.Version()); ver.Major < 0 || ver.AfterOrEqual(goversion.GoVersion{1, 10, -1, 0, 0, ""}) {
+	if ver, _ := goversion.Parse(runtime.Version()); ver.Major < 0 || ver.AfterOrEqual(goversion.GoVersion{Major: 1, Minor: 10, Rev: -1}) {
 		t.Skip("not supported in go1.10 and later")
 	}
 
@@ -312,17 +320,18 @@ func TestCoreFpRegisters(t *testing.T) {
 		{"XMM8", "0x4059999a404ccccd4059999a404ccccd"},
 	}
 
-	for _, reg := range regs.Slice(true) {
-		t.Logf("%s = %s", reg.Name, reg.Value)
-	}
+	arch := p.BinInfo().Arch
+	logRegisters(t, regs, arch)
+	dregs := arch.RegistersToDwarfRegisters(0, regs)
 
 	for _, regtest := range regtests {
 		found := false
-		for _, reg := range regs.Slice(true) {
-			if reg.Name == regtest.name {
+		for i, reg := range dregs.Regs {
+			regname, _, regval := arch.DwarfRegisterToString(i, reg)
+			if reg != nil && regname == regtest.name {
 				found = true
-				if !strings.HasPrefix(reg.Value, regtest.value) {
-					t.Fatalf("register %s expected %q got %q", reg.Name, regtest.value, reg.Value)
+				if !strings.HasPrefix(regval, regtest.value) {
+					t.Fatalf("register %s expected %q got %q", regname, regtest.value, regval)
 				}
 			}
 		}
@@ -359,11 +368,12 @@ mainSearch:
 	}
 
 	scope := proc.FrameToScope(p.BinInfo(), p.CurrentThread(), nil, *mainFrame)
-	v1, err := scope.EvalVariable("t", proc.LoadConfig{true, 1, 64, 64, -1, 0})
+	loadConfig := proc.LoadConfig{FollowPointers: true, MaxVariableRecurse: 1, MaxStringLen: 64, MaxArrayValues: 64, MaxStructFields: -1}
+	v1, err := scope.EvalVariable("t", loadConfig)
 	assertNoError(err, t, "EvalVariable(t)")
 	assertNoError(v1.Unreadable, t, "unreadable variable 't'")
 	t.Logf("t = %#v\n", v1)
-	v2, err := scope.EvalVariable("s", proc.LoadConfig{true, 1, 64, 64, -1, 0})
+	v2, err := scope.EvalVariable("s", loadConfig)
 	assertNoError(err, t, "EvalVariable(s)")
 	assertNoError(v2.Unreadable, t, "unreadable variable 's'")
 	t.Logf("s = %#v\n", v2)

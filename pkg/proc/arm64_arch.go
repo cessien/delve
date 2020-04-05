@@ -1,33 +1,21 @@
 package proc
 
 import (
+	"bytes"
 	"encoding/binary"
+	"fmt"
+	"io"
+	"strings"
 
 	"github.com/go-delve/delve/pkg/dwarf/frame"
 	"github.com/go-delve/delve/pkg/dwarf/op"
 	"golang.org/x/arch/arm64/arm64asm"
 )
 
-// ARM64 represents the ARM64 CPU architecture.
-type ARM64 struct {
-	gStructOffset uint64
-	goos          string
-
-	// crosscall2fn is the DIE of crosscall2, a function used by the go runtime
-	// to call C functions. This function in go 1.9 (and previous versions) had
-	// a bad frame descriptor which needs to be fixed to generate good stack
-	// traces.
-	crosscall2fn *Function
-
-	// sigreturnfn is the DIE of runtime.sigreturn, the return trampoline for
-	// the signal handler. See comment in FixFrameUnwindContext for a
-	// description of why this is needed.
-	sigreturnfn *Function
-}
-
 const (
 	arm64DwarfIPRegNum uint64 = 32
 	arm64DwarfSPRegNum uint64 = 31
+	arm64DwarfLRRegNum uint64 = 30
 	arm64DwarfBPRegNum uint64 = 29
 )
 
@@ -35,51 +23,28 @@ var arm64BreakInstruction = []byte{0x0, 0x0, 0x20, 0xd4}
 
 // ARM64Arch returns an initialized ARM64
 // struct.
-func ARM64Arch(goos string) *ARM64 {
-	return &ARM64{
-		goos: goos,
+func ARM64Arch(goos string) *Arch {
+	return &Arch{
+		Name:                             "arm64",
+		ptrSize:                          8,
+		maxInstructionLength:             4,
+		breakpointInstruction:            arm64BreakInstruction,
+		breakInstrMovesPC:                false,
+		derefTLS:                         false,
+		prologues:                        prologuesARM64,
+		fixFrameUnwindContext:            arm64FixFrameUnwindContext,
+		switchStack:                      arm64SwitchStack,
+		regSize:                          arm64RegSize,
+		RegistersToDwarfRegisters:        arm64RegistersToDwarfRegisters,
+		addrAndStackRegsToDwarfRegisters: arm64AddrAndStackRegsToDwarfRegisters,
+		DwarfRegisterToString:            arm64DwarfRegisterToString,
+		inhibitStepInto:                  func(*BinaryInfo, uint64) bool { return false },
+		asmDecode:                        arm64AsmDecode,
 	}
 }
 
-// PtrSize returns the size of a pointer
-// on this architecture.
-func (a *ARM64) PtrSize() int {
-	return 8
-}
-
-// MinInstructionLength returns the min lenth
-// of the instruction
-func (a *ARM64) MinInstructionLength() int {
-	return 4
-}
-
-// BreakpointInstruction returns the Breakpoint
-// instruction for this architecture.
-func (a *ARM64) BreakpointInstruction() []byte {
-	return arm64BreakInstruction
-}
-
-// BreakInstrMovesPC returns whether the
-// breakpoint instruction will change the value
-// of PC after being executed
-func (a *ARM64) BreakInstrMovesPC() bool {
-	return false
-}
-
-// BreakpointSize returns the size of the
-// breakpoint instruction on this architecture.
-func (a *ARM64) BreakpointSize() int {
-	return len(arm64BreakInstruction)
-}
-
-// Always return false for now.
-func (a *ARM64) DerefTLS() bool {
-	return false
-}
-
-// FixFrameUnwindContext adds default architecture rules to fctxt or returns
-// the default frame unwind context if fctxt is nil.
-func (a *ARM64) FixFrameUnwindContext(fctxt *frame.FrameContext, pc uint64, bi *BinaryInfo) *frame.FrameContext {
+func arm64FixFrameUnwindContext(fctxt *frame.FrameContext, pc uint64, bi *BinaryInfo) *frame.FrameContext {
+	a := bi.Arch
 	if a.sigreturnfn == nil {
 		a.sigreturnfn = bi.LookupFunc["runtime.sigreturn"]
 	}
@@ -134,7 +99,7 @@ func (a *ARM64) FixFrameUnwindContext(fctxt *frame.FrameContext, pc uint64, bi *
 	if a.crosscall2fn != nil && pc >= a.crosscall2fn.Entry && pc < a.crosscall2fn.End {
 		rule := fctxt.CFA
 		if rule.Offset == crosscall2SPOffsetBad {
-			switch a.goos {
+			switch bi.GOOS {
 			case "windows":
 				rule.Offset += crosscall2SPOffsetWindows
 			default:
@@ -155,11 +120,118 @@ func (a *ARM64) FixFrameUnwindContext(fctxt *frame.FrameContext, pc uint64, bi *
 			Offset: 0,
 		}
 	}
+	if fctxt.Regs[arm64DwarfLRRegNum].Rule == frame.RuleUndefined {
+		fctxt.Regs[arm64DwarfLRRegNum] = frame.DWRule{
+			Rule:   frame.RuleFramePointer,
+			Reg:    arm64DwarfLRRegNum,
+			Offset: 0,
+		}
+	}
 
 	return fctxt
 }
 
-func (a *ARM64) RegSize(regnum uint64) int {
+const arm64cgocallSPOffsetSaveSlot = 0x8
+const prevG0schedSPOffsetSaveSlot = 0x10
+const spAlign = 16
+
+func arm64SwitchStack(it *stackIterator, callFrameRegs *op.DwarfRegisters) bool {
+	if it.frame.Current.Fn != nil {
+		switch it.frame.Current.Fn.Name {
+		case "runtime.asmcgocall", "runtime.cgocallback_gofunc", "runtime.sigpanic":
+			//do nothing
+		case "runtime.goexit", "runtime.rt0_go", "runtime.mcall":
+			// Look for "top of stack" functions.
+			it.atend = true
+			return true
+		case "crosscall2":
+			//The offsets get from runtime/cgo/asm_arm64.s:10
+			newsp, _ := readUintRaw(it.mem, uintptr(it.regs.SP()+8*24), int64(it.bi.Arch.PtrSize()))
+			newbp, _ := readUintRaw(it.mem, uintptr(it.regs.SP()+8*14), int64(it.bi.Arch.PtrSize()))
+			newlr, _ := readUintRaw(it.mem, uintptr(it.regs.SP()+8*15), int64(it.bi.Arch.PtrSize()))
+			if it.regs.Reg(it.regs.BPRegNum) != nil {
+				it.regs.Reg(it.regs.BPRegNum).Uint64Val = uint64(newbp)
+			} else {
+				reg, _ := it.readRegisterAt(it.regs.BPRegNum, it.regs.SP()+8*14)
+				it.regs.AddReg(it.regs.BPRegNum, reg)
+			}
+			it.regs.Reg(it.regs.LRRegNum).Uint64Val = uint64(newlr)
+			it.regs.Reg(it.regs.SPRegNum).Uint64Val = uint64(newsp)
+			it.pc = newlr
+			return true
+		default:
+			if it.systemstack && it.top && it.g != nil && strings.HasPrefix(it.frame.Current.Fn.Name, "runtime.") && it.frame.Current.Fn.Name != "runtime.fatalthrow" {
+				// The runtime switches to the system stack in multiple places.
+				// This usually happens through a call to runtime.systemstack but there
+				// are functions that switch to the system stack manually (for example
+				// runtime.morestack).
+				// Since we are only interested in printing the system stack for cgo
+				// calls we switch directly to the goroutine stack if we detect that the
+				// function at the top of the stack is a runtime function.
+				it.switchToGoroutineStack()
+				return true
+			}
+		}
+	}
+
+	fn := it.bi.PCToFunc(it.frame.Ret)
+	if fn == nil {
+		return false
+	}
+	switch fn.Name {
+	case "runtime.asmcgocall":
+		if !it.systemstack {
+			return false
+		}
+
+		// This function is called by a goroutine to execute a C function and
+		// switches from the goroutine stack to the system stack.
+		// Since we are unwinding the stack from callee to caller we have to switch
+		// from the system stack to the goroutine stack.
+		off, _ := readIntRaw(it.mem, uintptr(callFrameRegs.SP()+arm64cgocallSPOffsetSaveSlot), int64(it.bi.Arch.PtrSize()))
+		oldsp := callFrameRegs.SP()
+		newsp := uint64(int64(it.stackhi) - off)
+
+		// runtime.asmcgocall can also be called from inside the system stack,
+		// in that case no stack switch actually happens
+		if newsp == oldsp {
+			return false
+		}
+		it.systemstack = false
+		callFrameRegs.Reg(callFrameRegs.SPRegNum).Uint64Val = uint64(int64(newsp))
+		return false
+
+	case "runtime.cgocallback_gofunc":
+		// For a detailed description of how this works read the long comment at
+		// the start of $GOROOT/src/runtime/cgocall.go and the source code of
+		// runtime.cgocallback_gofunc in $GOROOT/src/runtime/asm_arm64.s
+		//
+		// When a C functions calls back into go it will eventually call into
+		// runtime.cgocallback_gofunc which is the function that does the stack
+		// switch from the system stack back into the goroutine stack
+		// Since we are going backwards on the stack here we see the transition
+		// as goroutine stack -> system stack.
+		if it.systemstack {
+			return false
+		}
+
+		it.loadG0SchedSP()
+		if it.g0_sched_sp <= 0 {
+			return false
+		}
+		// entering the system stack
+		callFrameRegs.Reg(callFrameRegs.SPRegNum).Uint64Val = it.g0_sched_sp
+		// reads the previous value of g0.sched.sp that runtime.cgocallback_gofunc saved on the stack
+
+		it.g0_sched_sp, _ = readUintRaw(it.mem, uintptr(callFrameRegs.SP()+prevG0schedSPOffsetSaveSlot), int64(it.bi.Arch.PtrSize()))
+		it.systemstack = true
+		return false
+	}
+
+	return false
+}
+
+func arm64RegSize(regnum uint64) int {
 	// fp registers
 	if regnum >= 64 && regnum <= 95 {
 		return 16
@@ -250,14 +322,15 @@ func maxArm64DwarfRegister() int {
 	return max
 }
 
-// RegistersToDwarfRegisters converts hardware registers to the format used
-// by the DWARF expression interpreter.
-func (a *ARM64) RegistersToDwarfRegisters(staticBase uint64, regs Registers) op.DwarfRegisters {
+func arm64RegistersToDwarfRegisters(staticBase uint64, regs Registers) op.DwarfRegisters {
 	dregs := make([]*op.DwarfRegister, maxArm64DwarfRegister()+1)
 
 	dregs[arm64DwarfIPRegNum] = op.DwarfRegisterFromUint64(regs.PC())
 	dregs[arm64DwarfSPRegNum] = op.DwarfRegisterFromUint64(regs.SP())
 	dregs[arm64DwarfBPRegNum] = op.DwarfRegisterFromUint64(regs.BP())
+	if lr, err := regs.Get(int(arm64asm.X30)); err != nil {
+		dregs[arm64DwarfLRRegNum] = op.DwarfRegisterFromUint64(lr)
+	}
 
 	for dwarfReg, asmReg := range arm64DwarfToHardware {
 		v, err := regs.Get(int(asmReg))
@@ -273,16 +346,16 @@ func (a *ARM64) RegistersToDwarfRegisters(staticBase uint64, regs Registers) op.
 		PCRegNum:   arm64DwarfIPRegNum,
 		SPRegNum:   arm64DwarfSPRegNum,
 		BPRegNum:   arm64DwarfBPRegNum,
+		LRRegNum:   arm64DwarfLRRegNum,
 	}
 }
 
-// AddrAndStackRegsToDwarfRegisters returns DWARF registers from the passed in
-// PC, SP, and BP registers in the format used by the DWARF expression interpreter.
-func (a *ARM64) AddrAndStackRegsToDwarfRegisters(staticBase, pc, sp, bp uint64) op.DwarfRegisters {
+func arm64AddrAndStackRegsToDwarfRegisters(staticBase, pc, sp, bp, lr uint64) op.DwarfRegisters {
 	dregs := make([]*op.DwarfRegister, arm64DwarfIPRegNum+1)
 	dregs[arm64DwarfIPRegNum] = op.DwarfRegisterFromUint64(pc)
 	dregs[arm64DwarfSPRegNum] = op.DwarfRegisterFromUint64(sp)
 	dregs[arm64DwarfBPRegNum] = op.DwarfRegisterFromUint64(bp)
+	dregs[arm64DwarfLRRegNum] = op.DwarfRegisterFromUint64(lr)
 
 	return op.DwarfRegisters{
 		StaticBase: staticBase,
@@ -291,5 +364,61 @@ func (a *ARM64) AddrAndStackRegsToDwarfRegisters(staticBase, pc, sp, bp uint64) 
 		PCRegNum:   arm64DwarfIPRegNum,
 		SPRegNum:   arm64DwarfSPRegNum,
 		BPRegNum:   arm64DwarfBPRegNum,
+		LRRegNum:   arm64DwarfLRRegNum,
 	}
+}
+
+func arm64DwarfRegisterToString(i int, reg *op.DwarfRegister) (name string, floatingPoint bool, repr string) {
+	// see arm64DwarfToHardware table for explanation
+	switch {
+	case i <= 30:
+		name = fmt.Sprintf("X%d", i)
+	case i == 31:
+		name = "SP"
+	case i == 32:
+		name = "PC"
+	case i >= 64 && i <= 95:
+		name = fmt.Sprintf("V%d", i-64)
+	default:
+		name = fmt.Sprintf("unknown%d", i)
+	}
+
+	if reg.Bytes != nil && name[0] == 'V' {
+		buf := bytes.NewReader(reg.Bytes)
+
+		var out bytes.Buffer
+		var vi [16]uint8
+		for i := range vi {
+			binary.Read(buf, binary.LittleEndian, &vi[i])
+		}
+
+		fmt.Fprintf(&out, "0x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x", vi[15], vi[14], vi[13], vi[12], vi[11], vi[10], vi[9], vi[8], vi[7], vi[6], vi[5], vi[4], vi[3], vi[2], vi[1], vi[0])
+
+		fmt.Fprintf(&out, "\tv2_int={ %02x%02x%02x%02x%02x%02x%02x%02x %02x%02x%02x%02x%02x%02x%02x%02x }", vi[7], vi[6], vi[5], vi[4], vi[3], vi[2], vi[1], vi[0], vi[15], vi[14], vi[13], vi[12], vi[11], vi[10], vi[9], vi[8])
+
+		fmt.Fprintf(&out, "\tv4_int={ %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x }", vi[3], vi[2], vi[1], vi[0], vi[7], vi[6], vi[5], vi[4], vi[11], vi[10], vi[9], vi[8], vi[15], vi[14], vi[13], vi[12])
+
+		fmt.Fprintf(&out, "\tv8_int={ %02x%02x %02x%02x %02x%02x %02x%02x %02x%02x %02x%02x %02x%02x %02x%02x }", vi[1], vi[0], vi[3], vi[2], vi[5], vi[4], vi[7], vi[6], vi[9], vi[8], vi[11], vi[10], vi[13], vi[12], vi[15], vi[14])
+
+		fmt.Fprintf(&out, "\tv16_int={ %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x }", vi[0], vi[1], vi[2], vi[3], vi[4], vi[5], vi[6], vi[7], vi[8], vi[9], vi[10], vi[11], vi[12], vi[13], vi[14], vi[15])
+
+		buf.Seek(0, io.SeekStart)
+		var v2 [2]float64
+		for i := range v2 {
+			binary.Read(buf, binary.LittleEndian, &v2[i])
+		}
+		fmt.Fprintf(&out, "\tv2_float={ %g %g }", v2[0], v2[1])
+
+		buf.Seek(0, io.SeekStart)
+		var v4 [4]float32
+		for i := range v4 {
+			binary.Read(buf, binary.LittleEndian, &v4[i])
+		}
+		fmt.Fprintf(&out, "\tv4_float={ %g %g %g %g }", v4[0], v4[1], v4[2], v4[3])
+
+		return name, true, out.String()
+	} else if reg.Bytes == nil || (reg.Bytes != nil && len(reg.Bytes) < 16) {
+		return name, false, fmt.Sprintf("%#016x", reg.Uint64Val)
+	}
+	return name, false, fmt.Sprintf("%#x", reg.Bytes)
 }

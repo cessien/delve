@@ -83,13 +83,15 @@ type RestartOut struct {
 }
 
 // Restart restarts program.
-func (s *RPCServer) Restart(arg RestartIn, out *RestartOut) error {
+func (s *RPCServer) Restart(arg RestartIn, cb service.RPCCallback) {
 	if s.config.AttachPid != 0 {
-		return errors.New("cannot restart process Delve did not create")
+		cb.Return(nil, errors.New("cannot restart process Delve did not create"))
+		return
 	}
+	var out RestartOut
 	var err error
 	out.DiscardedBreakpoints, err = s.debugger.Restart(arg.Rerecord, arg.Position, arg.ResetArgs, arg.NewArgs)
-	return err
+	cb.Return(out, err)
 }
 
 type StateIn struct {
@@ -102,13 +104,15 @@ type StateOut struct {
 }
 
 // State returns the current debugger state.
-func (s *RPCServer) State(arg StateIn, out *StateOut) error {
+func (s *RPCServer) State(arg StateIn, cb service.RPCCallback) {
+	var out StateOut
 	st, err := s.debugger.State(arg.NonBlocking)
 	if err != nil {
-		return err
+		cb.Return(nil, err)
+		return
 	}
 	out.State = st
-	return nil
+	cb.Return(out, nil)
 }
 
 type CommandOut struct {
@@ -174,7 +178,7 @@ type StacktraceOut struct {
 func (s *RPCServer) Stacktrace(arg StacktraceIn, out *StacktraceOut) error {
 	cfg := arg.Cfg
 	if cfg == nil && arg.Full {
-		cfg = &api.LoadConfig{true, 1, 64, 64, -1}
+		cfg = &api.LoadConfig{FollowPointers: true, MaxVariableRecurse: 1, MaxStringLen: 64, MaxArrayValues: 64, MaxStructFields: -1}
 	}
 	if arg.Defers {
 		arg.Opts |= api.StacktraceReadDefers
@@ -368,6 +372,7 @@ func (s *RPCServer) ListPackageVars(arg ListPackageVarsIn, out *ListPackageVarsO
 type ListRegistersIn struct {
 	ThreadID  int
 	IncludeFp bool
+	Scope     *api.EvalScope
 }
 
 type ListRegistersOut struct {
@@ -376,8 +381,10 @@ type ListRegistersOut struct {
 }
 
 // ListRegisters lists registers and their values.
+// If ListRegistersIn.Scope is not nil the registers of that eval scope will
+// be returned, otherwise ListRegistersIn.ThreadID will be used.
 func (s *RPCServer) ListRegisters(arg ListRegistersIn, out *ListRegistersOut) error {
-	if arg.ThreadID == 0 {
+	if arg.ThreadID == 0 && arg.Scope == nil {
 		state, err := s.debugger.State(false)
 		if err != nil {
 			return err
@@ -385,7 +392,7 @@ func (s *RPCServer) ListRegisters(arg ListRegistersIn, out *ListRegistersOut) er
 		arg.ThreadID = state.CurrentThread.ID
 	}
 
-	regs, err := s.debugger.Registers(arg.ThreadID, arg.IncludeFp)
+	regs, err := s.debugger.Registers(arg.ThreadID, arg.Scope, arg.IncludeFp)
 	if err != nil {
 		return err
 	}
@@ -450,7 +457,7 @@ type EvalOut struct {
 func (s *RPCServer) Eval(arg EvalIn, out *EvalOut) error {
 	cfg := arg.Cfg
 	if cfg == nil {
-		cfg = &api.LoadConfig{true, 1, 64, 64, -1}
+		cfg = &api.LoadConfig{FollowPointers: true, MaxVariableRecurse: 1, MaxStringLen: 64, MaxArrayValues: 64, MaxStructFields: -1}
 	}
 	v, err := s.debugger.EvalVariableInScope(arg.Scope, arg.Expr, *api.LoadConfigToProc(cfg))
 	if err != nil {
@@ -730,4 +737,64 @@ type ListDynamicLibrariesOut struct {
 func (s *RPCServer) ListDynamicLibraries(in ListDynamicLibrariesIn, out *ListDynamicLibrariesOut) error {
 	out.List = s.debugger.ListDynamicLibraries()
 	return nil
+}
+
+// ListPackagesBuildInfoIn holds the arguments of ListPackages.
+type ListPackagesBuildInfoIn struct {
+	IncludeFiles bool
+}
+
+// ListPackagesBuildInfoOut holds the return values of ListPackages.
+type ListPackagesBuildInfoOut struct {
+	List []api.PackageBuildInfo
+}
+
+// ListPackagesBuildInfo returns the list of packages used by the program along with
+// the directory where each package was compiled and optionally the list of
+// files constituting the package.
+// Note that the directory path is a best guess and may be wrong is a tool
+// other than cmd/go is used to perform the build.
+func (s *RPCServer) ListPackagesBuildInfo(in ListPackagesBuildInfoIn, out *ListPackagesBuildInfoOut) error {
+	out.List = s.debugger.ListPackagesBuildInfo(in.IncludeFiles)
+	return nil
+}
+
+// ExamineMemoryIn holds the arguments of ExamineMemory
+type ExamineMemoryIn struct {
+	Address uintptr
+	Length  int
+}
+
+// ExaminedMemoryOut holds the return values of ExamineMemory
+type ExaminedMemoryOut struct {
+	Mem []byte
+}
+
+func (s *RPCServer) ExamineMemory(arg ExamineMemoryIn, out *ExaminedMemoryOut) error {
+	if arg.Length > 1000 {
+		return fmt.Errorf("len must be less than or equal to 1000")
+	}
+	Mem, err := s.debugger.ExamineMemory(arg.Address, arg.Length)
+	if err != nil {
+		return err
+	}
+
+	out.Mem = Mem
+	return nil
+}
+
+type StopRecordingIn struct {
+}
+
+type StopRecordingOut struct {
+}
+
+func (s *RPCServer) StopRecording(arg StopRecordingIn, cb service.RPCCallback) {
+	var out StopRecordingOut
+	err := s.debugger.StopRecording()
+	if err != nil {
+		cb.Return(nil, err)
+		return
+	}
+	cb.Return(out, nil)
 }

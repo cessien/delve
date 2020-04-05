@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 )
 
+// DwarfRegisters holds the value of stack program registers.
 type DwarfRegisters struct {
 	StaticBase uint64
 
@@ -17,6 +18,7 @@ type DwarfRegisters struct {
 	PCRegNum  uint64
 	SPRegNum  uint64
 	BPRegNum  uint64
+	LRRegNum  uint64
 }
 
 type DwarfRegister struct {

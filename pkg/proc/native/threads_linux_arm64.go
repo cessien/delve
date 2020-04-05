@@ -12,16 +12,18 @@ import (
 	"github.com/go-delve/delve/pkg/proc/linutil"
 )
 
-func (thread *Thread) fpRegisters() (fpregs []proc.Register, fpregset []byte, err error) {
-	thread.dbp.execPtraceFunc(func() { fpregset, err = PtraceGetFpRegset(thread.ID) })
-	fpregs = linutil.Decode(fpregset)
+func (thread *nativeThread) fpRegisters() ([]proc.Register, []byte, error) {
+	var err error
+	var arm_fpregs linutil.ARM64PtraceFpRegs
+	thread.dbp.execPtraceFunc(func() { arm_fpregs.Vregs, err = ptraceGetFpRegset(thread.ID) })
+	fpregs := arm_fpregs.Decode()
 	if err != nil {
 		err = fmt.Errorf("could not get floating point registers: %v", err.Error())
 	}
-	return
+	return fpregs, arm_fpregs.Vregs, err
 }
 
-func (t *Thread) restoreRegisters(savedRegs proc.Registers) error {
+func (t *nativeThread) restoreRegisters(savedRegs proc.Registers) error {
 	sr := savedRegs.(*linutil.ARM64Registers)
 
 	var restoreRegistersErr error

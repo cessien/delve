@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"go/constant"
 	"testing"
+	"unsafe"
 
 	"github.com/go-delve/delve/pkg/dwarf/dwarfbuilder"
 	"github.com/go-delve/delve/pkg/dwarf/godwarf"
@@ -19,7 +20,20 @@ import (
 	"github.com/go-delve/delve/pkg/proc/linutil"
 )
 
-const defaultCFA = 0xc420051d00
+func ptrSizeByRuntimeArch() int {
+	return int(unsafe.Sizeof(uintptr(0)))
+}
+
+func fakeCFA() uint64 {
+	ptrSize := ptrSizeByRuntimeArch()
+	if ptrSize == 8 {
+		return 0xc420051d00
+	}
+	if ptrSize == 4 {
+		return 0xc4251d00
+	}
+	panic(fmt.Errorf("not support ptr size %d", ptrSize))
+}
 
 func fakeBinaryInfo(t *testing.T, dwb *dwarfbuilder.Builder) (*proc.BinaryInfo, *dwarf.Data) {
 	abbrev, aranges, frame, info, line, pubnames, ranges, str, loc, err := dwb.Build()
@@ -92,8 +106,8 @@ func dwarfRegisters(bi *proc.BinaryInfo, regs *linutil.AMD64Registers) op.DwarfR
 	a := proc.AMD64Arch("linux")
 	so := bi.PCToImage(regs.PC())
 	dwarfRegs := a.RegistersToDwarfRegisters(so.StaticBase, regs)
-	dwarfRegs.CFA = defaultCFA
-	dwarfRegs.FrameBase = defaultCFA
+	dwarfRegs.CFA = int64(fakeCFA())
+	dwarfRegs.FrameBase = int64(fakeCFA())
 	return dwarfRegs
 }
 
@@ -118,8 +132,7 @@ func TestDwarfExprRegisters(t *testing.T) {
 	bi, _ := fakeBinaryInfo(t, dwb)
 
 	mainfn := bi.LookupFunc["main.main"]
-
-	mem := newFakeMemory(defaultCFA, uint64(0), uint64(testCases["b"]), uint16(testCases["pair.v"]))
+	mem := newFakeMemory(fakeCFA(), uint64(0), uint64(testCases["b"]))
 	regs := linutil.AMD64Registers{Regs: &linutil.AMD64PtraceRegs{}}
 	regs.Regs.Rax = uint64(testCases["a"])
 	regs.Regs.Rdx = uint64(testCases["c"])
@@ -171,11 +184,11 @@ func TestDwarfExprComposite(t *testing.T) {
 
 	mainfn := bi.LookupFunc["main.main"]
 
-	mem := newFakeMemory(defaultCFA, uint64(0), uint64(0), uint16(testCases["pair.v"]), []byte(stringVal))
+	mem := newFakeMemory(fakeCFA(), uint64(0), uint64(0), uint16(testCases["pair.v"]), []byte(stringVal))
 	var regs linutil.AMD64Registers
 	regs.Regs = &linutil.AMD64PtraceRegs{}
 	regs.Regs.Rax = uint64(len(stringVal))
-	regs.Regs.Rdx = defaultCFA + 18
+	regs.Regs.Rdx = fakeCFA() + 18
 	regs.Regs.Rcx = uint64(testCases["pair.k"])
 	regs.Regs.Rbx = uint64(testCases["n"])
 
@@ -202,8 +215,8 @@ func TestDwarfExprLoclist(t *testing.T) {
 
 	dwb.AddSubprogram("main.main", 0x40100, 0x41000)
 	dwb.AddVariable("a", uint16off, []dwarfbuilder.LocEntry{
-		{0x40100, 0x40700, dwarfbuilder.LocationBlock(op.DW_OP_call_frame_cfa)},
-		{0x40700, 0x41000, dwarfbuilder.LocationBlock(op.DW_OP_call_frame_cfa, op.DW_OP_consts, int(2), op.DW_OP_plus)},
+		{Lowpc: 0x40100, Highpc: 0x40700, Loc: dwarfbuilder.LocationBlock(op.DW_OP_call_frame_cfa)},
+		{Lowpc: 0x40700, Highpc: 0x41000, Loc: dwarfbuilder.LocationBlock(op.DW_OP_call_frame_cfa, op.DW_OP_consts, int(2), op.DW_OP_plus)},
 	})
 	dwb.TagClose()
 
@@ -211,7 +224,7 @@ func TestDwarfExprLoclist(t *testing.T) {
 
 	mainfn := bi.LookupFunc["main.main"]
 
-	mem := newFakeMemory(defaultCFA, uint16(before), uint16(after))
+	mem := newFakeMemory(fakeCFA(), uint16(before), uint16(after))
 	const PC = 0x40100
 	regs := linutil.AMD64Registers{Regs: &linutil.AMD64PtraceRegs{Rip: PC}}
 
@@ -248,7 +261,7 @@ func TestIssue1419(t *testing.T) {
 
 	mainfn := bi.LookupFunc["main.main"]
 
-	mem := newFakeMemory(defaultCFA)
+	mem := newFakeMemory(fakeCFA())
 
 	scope := &proc.EvalScope{Location: proc.Location{PC: 0x40100, Fn: mainfn}, Regs: op.DwarfRegisters{}, Mem: mem, BinInfo: bi}
 
@@ -275,8 +288,8 @@ func TestLocationCovers(t *testing.T) {
 	dwb.AddCompileUnit("main", 0x0)
 	dwb.AddSubprogram("main.main", 0x40100, 0x41000)
 	aOff := dwb.AddVariable("a", uint16off, []dwarfbuilder.LocEntry{
-		{0x40100, 0x40700, dwarfbuilder.LocationBlock(op.DW_OP_call_frame_cfa)},
-		{0x40700, 0x41000, dwarfbuilder.LocationBlock(op.DW_OP_call_frame_cfa, op.DW_OP_consts, int(2), op.DW_OP_plus)},
+		{Lowpc: 0x40100, Highpc: 0x40700, Loc: dwarfbuilder.LocationBlock(op.DW_OP_call_frame_cfa)},
+		{Lowpc: 0x40700, Highpc: 0x41000, Loc: dwarfbuilder.LocationBlock(op.DW_OP_call_frame_cfa, op.DW_OP_consts, int(2), op.DW_OP_plus)},
 	})
 	dwb.TagClose()
 	dwb.TagClose()

@@ -27,16 +27,23 @@ import (
 	"github.com/go-delve/delve/pkg/dwarf/loclist"
 	"github.com/go-delve/delve/pkg/dwarf/op"
 	"github.com/go-delve/delve/pkg/dwarf/reader"
+	"github.com/go-delve/delve/pkg/dwarf/util"
 	"github.com/go-delve/delve/pkg/goversion"
 	"github.com/go-delve/delve/pkg/logflags"
+	"github.com/hashicorp/golang-lru/simplelru"
 	"github.com/sirupsen/logrus"
+)
+
+const (
+	dwarfGoLanguage    = 22  // DW_LANG_Go (from DWARF v5, section 7.12, page 231)
+	dwarfTreeCacheSize = 512 // size of the dwarfTree cache of each image
 )
 
 // BinaryInfo holds information on the binaries being executed (this
 // includes both the executable and also any loaded libraries).
 type BinaryInfo struct {
 	// Architecture of this binary.
-	Arch Arch
+	Arch *Arch
 
 	// GOOS operating system this binary is executing on.
 	GOOS string
@@ -49,6 +56,9 @@ type BinaryInfo struct {
 	Sources []string
 	// LookupFunc maps function names to a description of the function.
 	LookupFunc map[string]*Function
+
+	// SymNames maps addr to a description *elf.Symbol of this addr.
+	SymNames map[uint64]*elf.Symbol
 
 	// Images is a list of loaded shared libraries (also known as
 	// shared objects on linux or DLLs on windows).
@@ -97,24 +107,167 @@ type BinaryInfo struct {
 	logger *logrus.Entry
 }
 
-// ErrUnsupportedLinuxArch is returned when attempting to debug a binary compiled for an unsupported architecture.
-var ErrUnsupportedLinuxArch = errors.New("unsupported architecture - only linux/amd64 and linux/arm64 are supported")
+var (
+	// ErrCouldNotDetermineRelocation is an error returned when Delve could not determine the base address of a
+	// position independant executable.
+	ErrCouldNotDetermineRelocation = errors.New("could not determine the base address of a PIE")
 
-// ErrUnsupportedWindowsArch is returned when attempting to debug a binary compiled for an unsupported architecture.
-var ErrUnsupportedWindowsArch = errors.New("unsupported architecture of windows/386 - only windows/amd64 is supported")
+	// ErrNoDebugInfoFound is returned when Delve cannot open the debug_info
+	// section or find an external debug info file.
+	ErrNoDebugInfoFound = errors.New("could not open debug info")
+)
 
-// ErrUnsupportedDarwinArch is returned when attempting to debug a binary compiled for an unsupported architecture.
-var ErrUnsupportedDarwinArch = errors.New("unsupported architecture - only darwin/amd64 is supported")
+var (
+	supportedLinuxArch = map[elf.Machine]bool{
+		elf.EM_X86_64:  true,
+		elf.EM_AARCH64: true,
+		elf.EM_386:     true,
+	}
 
-// ErrCouldNotDetermineRelocation is an error returned when Delve could not determine the base address of a
-// position independant executable.
-var ErrCouldNotDetermineRelocation = errors.New("could not determine the base address of a PIE")
+	supportedWindowsArch = map[PEMachine]bool{
+		IMAGE_FILE_MACHINE_AMD64: true,
+	}
 
-// ErrNoDebugInfoFound is returned when Delve cannot open the debug_info
-// section or find an external debug info file.
-var ErrNoDebugInfoFound = errors.New("could not open debug info")
+	supportedDarwinArch = map[macho.Cpu]bool{
+		macho.CpuAmd64: true,
+	}
+)
 
-const dwarfGoLanguage = 22 // DW_LANG_Go (from DWARF v5, section 7.12, page 231)
+// ErrFunctionNotFound is returned when failing to find the
+// function named 'FuncName' within the binary.
+type ErrFunctionNotFound struct {
+	FuncName string
+}
+
+func (err *ErrFunctionNotFound) Error() string {
+	return fmt.Sprintf("could not find function %s\n", err.FuncName)
+}
+
+// FindFileLocation returns the PC for a given file:line.
+// Assumes that `file` is normalized to lower case and '/' on Windows.
+func FindFileLocation(p Process, fileName string, lineno int) ([]uint64, error) {
+	pcs, err := p.BinInfo().LineToPC(fileName, lineno)
+	if err != nil {
+		return nil, err
+	}
+	var fn *Function
+	for i := range pcs {
+		if fn == nil || pcs[i] < fn.Entry || pcs[i] >= fn.End {
+			fn = p.BinInfo().PCToFunc(pcs[i])
+		}
+		if fn != nil && fn.Entry == pcs[i] {
+			pcs[i], _ = FirstPCAfterPrologue(p, fn, true)
+		}
+	}
+	return pcs, nil
+}
+
+// FindFunctionLocation finds address of a function's line
+// If lineOffset is passed FindFunctionLocation will return the address of that line
+func FindFunctionLocation(p Process, funcName string, lineOffset int) ([]uint64, error) {
+	bi := p.BinInfo()
+	origfn := bi.LookupFunc[funcName]
+	if origfn == nil {
+		return nil, &ErrFunctionNotFound{funcName}
+	}
+
+	if lineOffset <= 0 {
+		r := make([]uint64, 0, len(origfn.InlinedCalls)+1)
+		if origfn.Entry > 0 {
+			// add concrete implementation of the function
+			pc, err := FirstPCAfterPrologue(p, origfn, false)
+			if err != nil {
+				return nil, err
+			}
+			r = append(r, pc)
+		}
+		// add inlined calls to the function
+		for _, call := range origfn.InlinedCalls {
+			r = append(r, call.LowPC)
+		}
+		if len(r) == 0 {
+			return nil, &ErrFunctionNotFound{funcName}
+		}
+		return r, nil
+	}
+	filename, lineno := origfn.cu.lineInfo.PCToLine(origfn.Entry, origfn.Entry)
+	return bi.LineToPC(filename, lineno+lineOffset)
+}
+
+// FirstPCAfterPrologue returns the address of the first
+// instruction after the prologue for function fn.
+// If sameline is set FirstPCAfterPrologue will always return an
+// address associated with the same line as fn.Entry.
+func FirstPCAfterPrologue(p Process, fn *Function, sameline bool) (uint64, error) {
+	pc, _, line, ok := fn.cu.lineInfo.PrologueEndPC(fn.Entry, fn.End)
+	if ok {
+		if !sameline {
+			return pc, nil
+		}
+		_, entryLine := fn.cu.lineInfo.PCToLine(fn.Entry, fn.Entry)
+		if entryLine == line {
+			return pc, nil
+		}
+	}
+
+	pc, err := firstPCAfterPrologueDisassembly(p, fn, sameline)
+	if err != nil {
+		return fn.Entry, err
+	}
+
+	if pc == fn.Entry {
+		// Look for the first instruction with the stmt flag set, so that setting a
+		// breakpoint with file:line and with the function name always result on
+		// the same instruction being selected.
+		if pc2, _, _, ok := fn.cu.lineInfo.FirstStmtForLine(fn.Entry, fn.End); ok {
+			return pc2, nil
+		}
+	}
+
+	return pc, nil
+}
+
+// CpuArch is a stringer interface representing CPU architectures.
+type CpuArch interface {
+	String() string
+}
+
+// ErrUnsupportedArch is returned when attempting to debug a binary compiled for an unsupported architecture.
+type ErrUnsupportedArch struct {
+	os      string
+	cpuArch CpuArch
+}
+
+func (e *ErrUnsupportedArch) Error() string {
+	var supportArchs []CpuArch
+	switch e.os {
+	case "linux":
+		for linuxArch, _ := range supportedLinuxArch {
+			supportArchs = append(supportArchs, linuxArch)
+		}
+	case "windows":
+		for windowArch, _ := range supportedWindowsArch {
+			supportArchs = append(supportArchs, windowArch)
+		}
+	case "darwin":
+		for darwinArch, _ := range supportedDarwinArch {
+			supportArchs = append(supportArchs, darwinArch)
+		}
+	}
+
+	errStr := "unsupported architecture of " + e.os + "/" + e.cpuArch.String()
+	errStr += " - only"
+	for _, arch := range supportArchs {
+		errStr += " " + e.os + "/" + arch.String() + " "
+	}
+	if len(supportArchs) == 1 {
+		errStr += "is supported"
+	} else {
+		errStr += "are supported"
+	}
+
+	return errStr
+}
 
 type compileUnit struct {
 	name   string // univocal name for non-go compile units
@@ -218,6 +371,22 @@ func (fn *Function) PrologueEndPC() uint64 {
 	return pc
 }
 
+// From $GOROOT/src/runtime/traceback.go:597
+// exportedRuntime reports whether the function is an exported runtime function.
+// It is only for runtime functions, so ASCII A-Z is fine.
+func (fn *Function) exportedRuntime() bool {
+	name := fn.Name
+	const n = len("runtime.")
+	return len(name) > n && name[:n] == "runtime." && 'A' <= name[n] && name[n] <= 'Z'
+}
+
+// unexportedRuntime reports whether the function is a private runtime function.
+func (fn *Function) privateRuntime() bool {
+	name := fn.Name
+	const n = len("runtime.")
+	return len(name) > n && name[:n] == "runtime." && !('A' <= name[n] && name[n] <= 'Z')
+}
+
 type constantsMap map[dwarfRef]*constantType
 
 type constantType struct {
@@ -260,12 +429,13 @@ func NewBinaryInfo(goos, goarch string) *BinaryInfo {
 
 	// TODO: find better way to determine proc arch (perhaps use executable file info).
 	switch goarch {
+	case "386":
+		r.Arch = I386Arch(goos)
 	case "amd64":
 		r.Arch = AMD64Arch(goos)
 	case "arm64":
 		r.Arch = ARM64Arch(goos)
 	}
-
 	return r
 }
 
@@ -351,7 +521,7 @@ func (bi *BinaryInfo) LineToPC(filename string, lineno int) (pcs []uint64, err e
 	fileFound := false
 	var pc uint64
 	for _, cu := range bi.compileUnits {
-		if cu.lineInfo.Lookup[filename] == nil {
+		if cu.lineInfo != nil && cu.lineInfo.Lookup[filename] == nil {
 			continue
 		}
 		fileFound = true
@@ -411,7 +581,7 @@ func (bi *BinaryInfo) AllPCsForFileLines(filename string, linenos []int) map[int
 		r[line] = make([]uint64, 0, 1)
 	}
 	for _, cu := range bi.compileUnits {
-		if cu.lineInfo.Lookup[filename] != nil {
+		if cu.lineInfo != nil && cu.lineInfo.Lookup[filename] != nil {
 			cu.lineInfo.AllPCsForFileLines(filename, r)
 		}
 	}
@@ -438,18 +608,16 @@ func (bi *BinaryInfo) PCToFunc(pc uint64) *Function {
 // If the PC address belongs to an inlined call it will return the inlined function.
 func (bi *BinaryInfo) PCToInlineFunc(pc uint64) *Function {
 	fn := bi.PCToFunc(pc)
-	irdr := reader.InlineStack(fn.cu.image.dwarf, fn.offset, reader.ToRelAddr(pc, fn.cu.image.StaticBase))
-	var inlineFnEntry *dwarf.Entry
-	for irdr.Next() {
-		inlineFnEntry = irdr.Entry()
+	dwarfTree, err := fn.cu.image.getDwarfTree(fn.offset)
+	if err != nil {
+		return fn
 	}
-
-	if inlineFnEntry == nil {
+	entries := reader.InlineStack(dwarfTree, pc)
+	if len(entries) == 0 {
 		return fn
 	}
 
-	e, _ := reader.LoadAbstractOrigin(inlineFnEntry, fn.cu.image.dwarfReader)
-	fnname, okname := e.Val(dwarf.AttrName).(string)
+	fnname, okname := entries[0].Val(dwarf.AttrName).(string)
 	if !okname {
 		return fn
 	}
@@ -479,6 +647,8 @@ type Image struct {
 	loclist     *loclist.Reader
 
 	typeCache map[dwarf.Offset]godwarf.Type
+
+	dwarfTreeCache *simplelru.LRU
 
 	// runtimeTypeToDIE maps between the offset of a runtime._type in
 	// runtime.moduledata.types and the offset of the DIE in debug_info. This
@@ -515,6 +685,8 @@ func (bi *BinaryInfo) AddImage(path string, addr uint64) error {
 
 	// Actually add the image.
 	image := &Image{Path: path, addr: addr, typeCache: make(map[dwarf.Offset]godwarf.Type)}
+	image.dwarfTreeCache, _ = simplelru.NewLRU(dwarfTreeCacheSize, nil)
+
 	// add Image regardless of error so that we don't attempt to re-add it every time we stop
 	image.index = len(bi.Images)
 	bi.Images = append(bi.Images, image)
@@ -600,6 +772,18 @@ func (image *Image) LoadError() error {
 	return image.loadErr
 }
 
+func (image *Image) getDwarfTree(off dwarf.Offset) (*godwarf.Tree, error) {
+	if r, ok := image.dwarfTreeCache.Get(off); ok {
+		return r.(*godwarf.Tree), nil
+	}
+	r, err := godwarf.LoadTree(off, image.dwarf, image.StaticBase)
+	if err != nil {
+		return nil, err
+	}
+	image.dwarfTreeCache.Add(off, r)
+	return r, nil
+}
+
 type nilCloser struct{}
 
 func (c *nilCloser) Close() error { return nil }
@@ -612,9 +796,10 @@ func (bi *BinaryInfo) LoadImageFromData(dwdata *dwarf.Data, debugFrameBytes, deb
 	image.sepDebugCloser = (*nilCloser)(nil)
 	image.dwarf = dwdata
 	image.typeCache = make(map[dwarf.Offset]godwarf.Type)
+	image.dwarfTreeCache, _ = simplelru.NewLRU(dwarfTreeCacheSize, nil)
 
 	if debugFrameBytes != nil {
-		bi.frameEntries = frame.Parse(debugFrameBytes, frame.DwarfEndian(debugFrameBytes), 0)
+		bi.frameEntries = frame.Parse(debugFrameBytes, frame.DwarfEndian(debugFrameBytes), 0, bi.Arch.PtrSize())
 	}
 
 	image.loclist = loclist.New(debugLocBytes, bi.Arch.PtrSize())
@@ -624,29 +809,51 @@ func (bi *BinaryInfo) LoadImageFromData(dwdata *dwarf.Data, debugFrameBytes, deb
 	bi.Images = append(bi.Images, image)
 }
 
-func (bi *BinaryInfo) locationExpr(entry reader.Entry, attr dwarf.Attr, pc uint64) ([]byte, string, error) {
+func (bi *BinaryInfo) locationExpr(entry godwarf.Entry, attr dwarf.Attr, pc uint64) ([]byte, *locationExpr, error) {
 	a := entry.Val(attr)
 	if a == nil {
-		return nil, "", fmt.Errorf("no location attribute %s", attr)
+		return nil, nil, fmt.Errorf("no location attribute %s", attr)
 	}
 	if instr, ok := a.([]byte); ok {
-		var descr bytes.Buffer
-		fmt.Fprintf(&descr, "[block] ")
-		op.PrettyPrint(&descr, instr)
-		return instr, descr.String(), nil
+		return instr, &locationExpr{isBlock: true, instr: instr}, nil
 	}
 	off, ok := a.(int64)
 	if !ok {
-		return nil, "", fmt.Errorf("could not interpret location attribute %s", attr)
+		return nil, nil, fmt.Errorf("could not interpret location attribute %s", attr)
 	}
 	instr := bi.loclistEntry(off, pc)
 	if instr == nil {
-		return nil, "", fmt.Errorf("could not find loclist entry at %#x for address %#x", off, pc)
+		return nil, nil, fmt.Errorf("could not find loclist entry at %#x for address %#x", off, pc)
+	}
+	return instr, &locationExpr{pc: pc, off: off, instr: instr}, nil
+}
+
+type locationExpr struct {
+	isBlock   bool
+	isEscaped bool
+	off       int64
+	pc        uint64
+	instr     []byte
+}
+
+func (le *locationExpr) String() string {
+	if le == nil {
+		return ""
 	}
 	var descr bytes.Buffer
-	fmt.Fprintf(&descr, "[%#x:%#x] ", off, pc)
-	op.PrettyPrint(&descr, instr)
-	return instr, descr.String(), nil
+
+	if le.isBlock {
+		fmt.Fprintf(&descr, "[block] ")
+		op.PrettyPrint(&descr, le.instr)
+	} else {
+		fmt.Fprintf(&descr, "[%#x:%#x] ", le.off, le.pc)
+		op.PrettyPrint(&descr, le.instr)
+	}
+
+	if le.isEscaped {
+		fmt.Fprintf(&descr, " (escaped)")
+	}
+	return descr.String()
 }
 
 // LocationCovers returns the list of PC addresses that is covered by the
@@ -692,12 +899,12 @@ func (bi *BinaryInfo) LocationCovers(entry *dwarf.Entry, attr dwarf.Attr) ([][2]
 // This will either be an int64 address or a slice of Pieces for locations
 // that don't correspond to a single memory address (registers, composite
 // locations).
-func (bi *BinaryInfo) Location(entry reader.Entry, attr dwarf.Attr, pc uint64, regs op.DwarfRegisters) (int64, []op.Piece, string, error) {
+func (bi *BinaryInfo) Location(entry godwarf.Entry, attr dwarf.Attr, pc uint64, regs op.DwarfRegisters) (int64, []op.Piece, *locationExpr, error) {
 	instr, descr, err := bi.locationExpr(entry, attr, pc)
 	if err != nil {
-		return 0, nil, "", err
+		return 0, nil, nil, err
 	}
-	addr, pieces, err := op.ExecuteStackProgram(regs, instr)
+	addr, pieces, err := op.ExecuteStackProgram(regs, instr, bi.Arch.PtrSize())
 	return addr, pieces, descr, err
 }
 
@@ -721,7 +928,7 @@ func (bi *BinaryInfo) loclistEntry(off int64, pc uint64) []byte {
 			base = e.HighPC
 			continue
 		}
-		if pc >= e.LowPC+base && pc < e.HighPC+base {
+		if pc >= e.LowPC+base+image.StaticBase && pc < e.HighPC+base+image.StaticBase {
 			return e.Instr
 		}
 	}
@@ -827,9 +1034,9 @@ func (bi *BinaryInfo) openSeparateDebugInfo(image *Image, exe *elf.File, debugIn
 		return nil, nil, fmt.Errorf("can't open separate debug file %q: %v", debugFilePath, err.Error())
 	}
 
-	if elfFile.Machine != elf.EM_X86_64 && elfFile.Machine != elf.EM_AARCH64 {
+	if !supportedLinuxArch[elfFile.Machine] {
 		sepFile.Close()
-		return nil, nil, fmt.Errorf("can't open separate debug file %q: %v", debugFilePath, ErrUnsupportedLinuxArch.Error())
+		return nil, nil, fmt.Errorf("can't open separate debug file %q: %v", debugFilePath, &ErrUnsupportedArch{os: "linux", cpuArch: elfFile.Machine})
 	}
 
 	return sepFile, elfFile, nil
@@ -875,8 +1082,8 @@ func loadBinaryInfoElf(bi *BinaryInfo, image *Image, path string, addr uint64, w
 	if err != nil {
 		return err
 	}
-	if elfFile.Machine != elf.EM_X86_64 && elfFile.Machine != elf.EM_AARCH64 {
-		return ErrUnsupportedLinuxArch
+	if !supportedLinuxArch[elfFile.Machine] {
+		return &ErrUnsupportedArch{os: "linux", cpuArch: elfFile.Machine}
 	}
 
 	if image.index == 0 {
@@ -924,15 +1131,35 @@ func loadBinaryInfoElf(bi *BinaryInfo, image *Image, path string, addr uint64, w
 	debugLocBytes, _ := godwarf.GetDebugSectionElf(dwarfFile, "loc")
 	image.loclist = loclist.New(debugLocBytes, bi.Arch.PtrSize())
 
-	wg.Add(2)
+	wg.Add(3)
 	go bi.parseDebugFrameElf(image, dwarfFile, wg)
 	go bi.loadDebugInfoMaps(image, debugLineBytes, wg, nil)
+	go bi.loadSymbolName(image, elfFile, wg)
 	if image.index == 0 {
 		// determine g struct offset only when loading the executable file
 		wg.Add(1)
 		go bi.setGStructOffsetElf(image, dwarfFile, wg)
 	}
 	return nil
+}
+
+//  STT_FUNC is a code object, see /usr/include/elf.h for a full definition.
+const STT_FUNC = 2
+
+func (bi *BinaryInfo) loadSymbolName(image *Image, file *elf.File, wg *sync.WaitGroup) {
+	defer wg.Done()
+	if bi.SymNames == nil {
+		bi.SymNames = make(map[uint64]*elf.Symbol)
+	}
+	symSecs, _ := file.Symbols()
+	if symSecs != nil {
+		for _, symSec := range symSecs {
+			if symSec.Info == STT_FUNC { // TODO(chainhelen), need to parse others types.
+				s := symSec
+				bi.SymNames[symSec.Value+image.StaticBase] = &s
+			}
+		}
+	}
 }
 
 func (bi *BinaryInfo) parseDebugFrameElf(image *Image, exe *elf.File, wg *sync.WaitGroup) {
@@ -949,7 +1176,7 @@ func (bi *BinaryInfo) parseDebugFrameElf(image *Image, exe *elf.File, wg *sync.W
 		return
 	}
 
-	bi.frameEntries = bi.frameEntries.Append(frame.Parse(debugFrameData, frame.DwarfEndian(debugInfoData), image.StaticBase))
+	bi.frameEntries = bi.frameEntries.Append(frame.Parse(debugFrameData, frame.DwarfEndian(debugInfoData), image.StaticBase, bi.Arch.PtrSize()))
 }
 
 func (bi *BinaryInfo) setGStructOffsetElf(image *Image, exe *elf.File, wg *sync.WaitGroup) {
@@ -957,7 +1184,9 @@ func (bi *BinaryInfo) setGStructOffsetElf(image *Image, exe *elf.File, wg *sync.
 
 	// This is a bit arcane. Essentially:
 	// - If the program is pure Go, it can do whatever it wants, and puts the G
-	//   pointer at %fs-8.
+	//   pointer at %fs-8 on 64 bit.
+	// - %Gs is the index of private storage in GDT on 32 bit, and puts the G
+	//   pointer at -4(tls).
 	// - Otherwise, Go asks the external linker to place the G pointer by
 	//   emitting runtime.tlsg, a TLS symbol, which is relocated to the chosen
 	//   offset in libc's TLS block.
@@ -974,10 +1203,6 @@ func (bi *BinaryInfo) setGStructOffsetElf(image *Image, exe *elf.File, wg *sync.
 			break
 		}
 	}
-	if tlsg == nil {
-		bi.gStructOffset = ^uint64(8) + 1 // -8
-		return
-	}
 	var tls *elf.Prog
 	for _, prog := range exe.Progs {
 		if prog.Type == elf.PT_TLS {
@@ -985,8 +1210,8 @@ func (bi *BinaryInfo) setGStructOffsetElf(image *Image, exe *elf.File, wg *sync.
 			break
 		}
 	}
-	if tls == nil {
-		bi.gStructOffset = ^uint64(8) + 1 // -8
+	if tlsg == nil || tls == nil {
+		bi.gStructOffset = ^uint64(bi.Arch.PtrSize()) + 1 //-ptrSize
 		return
 	}
 
@@ -1012,8 +1237,9 @@ func loadBinaryInfoPE(bi *BinaryInfo, image *Image, path string, entryPoint uint
 		return err
 	}
 	image.closer = closer
-	if peFile.Machine != pe.IMAGE_FILE_MACHINE_AMD64 {
-		return ErrUnsupportedWindowsArch
+	cpuArch := PEMachine(peFile.Machine)
+	if !supportedWindowsArch[cpuArch] {
+		return &ErrUnsupportedArch{os: "windows", cpuArch: cpuArch}
 	}
 	image.dwarf, err = peFile.DWARF()
 	if err != nil {
@@ -1078,7 +1304,7 @@ func (bi *BinaryInfo) parseDebugFramePE(image *Image, exe *pe.File, wg *sync.Wai
 		return
 	}
 
-	bi.frameEntries = bi.frameEntries.Append(frame.Parse(debugFrameBytes, frame.DwarfEndian(debugInfoBytes), image.StaticBase))
+	bi.frameEntries = bi.frameEntries.Append(frame.Parse(debugFrameBytes, frame.DwarfEndian(debugInfoBytes), image.StaticBase, bi.Arch.PtrSize()))
 }
 
 // Borrowed from https://golang.org/src/cmd/internal/objfile/pe.go
@@ -1107,8 +1333,8 @@ func loadBinaryInfoMacho(bi *BinaryInfo, image *Image, path string, entryPoint u
 		return err
 	}
 	image.closer = exe
-	if exe.Cpu != macho.CpuAmd64 {
-		return ErrUnsupportedDarwinArch
+	if !supportedDarwinArch[exe.Cpu] {
+		return &ErrUnsupportedArch{os: "darwin", cpuArch: exe.Cpu}
 	}
 	image.dwarf, err = exe.DWARF()
 	if err != nil {
@@ -1156,7 +1382,7 @@ func (bi *BinaryInfo) parseDebugFrameMacho(image *Image, exe *macho.File, wg *sy
 		return
 	}
 
-	bi.frameEntries = bi.frameEntries.Append(frame.Parse(debugFrameBytes, frame.DwarfEndian(debugInfoBytes), image.StaticBase))
+	bi.frameEntries = bi.frameEntries.Append(frame.Parse(debugFrameBytes, frame.DwarfEndian(debugInfoBytes), image.StaticBase, bi.Arch.PtrSize()))
 }
 
 // Do not call this function directly it isn't able to deal correctly with package paths
@@ -1317,8 +1543,8 @@ func (bi *BinaryInfo) loadDebugInfoMaps(image *Image, debugLineBytes []byte, wg 
 			if len(cu.ranges) >= 1 {
 				cu.lowPC = cu.ranges[0][0]
 			}
-			lineInfoOffset, _ := entry.Val(dwarf.AttrStmtList).(int64)
-			if lineInfoOffset >= 0 && lineInfoOffset < int64(len(debugLineBytes)) {
+			lineInfoOffset, hasLineInfo := entry.Val(dwarf.AttrStmtList).(int64)
+			if hasLineInfo && lineInfoOffset >= 0 && lineInfoOffset < int64(len(debugLineBytes)) {
 				var logfn func(string, ...interface{})
 				if logflags.DebugLineErrors() {
 					logger := logrus.New().WithFields(logrus.Fields{"layer": "dwarf-line"})
@@ -1327,7 +1553,7 @@ func (bi *BinaryInfo) loadDebugInfoMaps(image *Image, debugLineBytes []byte, wg 
 						logger.Printf(fmt, args)
 					}
 				}
-				cu.lineInfo = line.Parse(compdir, bytes.NewBuffer(debugLineBytes[lineInfoOffset:]), logfn, image.StaticBase)
+				cu.lineInfo = line.Parse(compdir, bytes.NewBuffer(debugLineBytes[lineInfoOffset:]), logfn, image.StaticBase, bi.GOOS == "windows", bi.Arch.PtrSize())
 			}
 			cu.producer, _ = entry.Val(dwarf.AttrProducer).(string)
 			if cu.isgo && cu.producer != "" {
@@ -1418,7 +1644,7 @@ func (bi *BinaryInfo) loadDebugInfoMapsCompileUnit(ctxt *loadDebugInfoMapsContex
 				var addr uint64
 				if loc, ok := entry.Val(dwarf.AttrLocation).([]byte); ok {
 					if len(loc) == bi.Arch.PtrSize()+1 && op.Opcode(loc[0]) == op.DW_OP_addr {
-						addr = binary.LittleEndian.Uint64(loc[1:])
+						addr, _ = util.ReadUintRaw(bytes.NewReader(loc[1:]), binary.LittleEndian, bi.Arch.PtrSize())
 					}
 				}
 				if !cu.isgo {
@@ -1741,6 +1967,9 @@ func (bi *BinaryInfo) symLookup(addr uint64) (string, uint64) {
 		}
 		return "", 0
 	}
+	if sym, ok := bi.SymNames[addr]; ok {
+		return sym.Name, addr
+	}
 	i := sort.Search(len(bi.packageVars), func(i int) bool {
 		return bi.packageVars[i].addr >= addr
 	})
@@ -1755,4 +1984,53 @@ func (bi *BinaryInfo) symLookup(addr uint64) (string, uint64) {
 		return bi.packageVars[i].name, bi.packageVars[i].addr
 	}
 	return "", 0
+}
+
+type PackageBuildInfo struct {
+	ImportPath    string
+	DirectoryPath string
+	Files         map[string]struct{}
+}
+
+// ListPackagesBuildInfo returns the list of packages used by the program along with
+// the directory where each package was compiled and optionally the list of
+// files constituting the package.
+func (bi *BinaryInfo) ListPackagesBuildInfo(includeFiles bool) []*PackageBuildInfo {
+	m := make(map[string]*PackageBuildInfo)
+	for _, cu := range bi.compileUnits {
+		if cu.image != bi.Images[0] || !cu.isgo || cu.lineInfo == nil {
+			//TODO(aarzilli): what's the correct thing to do for plugins?
+			continue
+		}
+
+		ip := strings.Replace(cu.name, "\\", "/", -1)
+		if _, ok := m[ip]; !ok {
+			path := cu.lineInfo.FirstFile()
+			if ext := filepath.Ext(path); ext != ".go" && ext != ".s" {
+				continue
+			}
+			dp := filepath.Dir(path)
+			m[ip] = &PackageBuildInfo{
+				ImportPath:    ip,
+				DirectoryPath: dp,
+				Files:         make(map[string]struct{}),
+			}
+		}
+
+		if includeFiles {
+			pbi := m[ip]
+
+			for _, file := range cu.lineInfo.FileNames {
+				pbi.Files[file.Path] = struct{}{}
+			}
+		}
+	}
+
+	r := make([]*PackageBuildInfo, 0, len(m))
+	for _, pbi := range m {
+		r = append(r, pbi)
+	}
+
+	sort.Slice(r, func(i, j int) bool { return r[i].ImportPath < r[j].ImportPath })
+	return r
 }

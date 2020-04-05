@@ -16,7 +16,6 @@ import (
 
 	"github.com/go-delve/delve/pkg/dwarf/godwarf"
 	"github.com/go-delve/delve/pkg/dwarf/op"
-	"github.com/go-delve/delve/pkg/dwarf/reader"
 	"github.com/go-delve/delve/pkg/goversion"
 )
 
@@ -119,8 +118,8 @@ type Variable struct {
 	loaded     bool
 	Unreadable error
 
-	LocationExpr string // location expression
-	DeclLine     int64  // line number of this variable's declaration
+	LocationExpr *locationExpr // location expression
+	DeclLine     int64         // line number of this variable's declaration
 }
 
 // LoadConfig controls how variables are loaded from the targets memory.
@@ -186,18 +185,18 @@ const (
 // G represents a runtime G (goroutine) structure (at least the
 // fields that Delve is interested in).
 type G struct {
-	ID         int    // Goroutine ID
-	PC         uint64 // PC of goroutine when it was parked.
-	SP         uint64 // SP of goroutine when it was parked.
-	BP         uint64 // BP of goroutine when it was parked (go >= 1.7).
-	GoPC       uint64 // PC of 'go' statement that created this goroutine.
-	StartPC    uint64 // PC of the first function run on this goroutine.
-	WaitReason string // Reason for goroutine being parked.
-	Status     uint64
-	stkbarVar  *Variable // stkbar field of g struct
-	stkbarPos  int       // stkbarPos field of g struct
-	stackhi    uint64    // value of stack.hi
-	stacklo    uint64    // value of stack.lo
+	ID        int    // Goroutine ID
+	PC        uint64 // PC of goroutine when it was parked.
+	SP        uint64 // SP of goroutine when it was parked.
+	BP        uint64 // BP of goroutine when it was parked (go >= 1.7).
+	LR        uint64 // LR of goroutine when it was parked.
+	GoPC      uint64 // PC of 'go' statement that created this goroutine.
+	StartPC   uint64 // PC of the first function run on this goroutine.
+	Status    uint64
+	stkbarVar *Variable // stkbar field of g struct
+	stkbarPos int       // stkbarPos field of g struct
+	stackhi   uint64    // value of stack.hi
+	stacklo   uint64    // value of stack.lo
 
 	SystemStack bool // SystemStack is true if this goroutine is currently executing on a system stack.
 
@@ -210,6 +209,251 @@ type G struct {
 	variable *Variable
 
 	Unreadable error // could not read the G struct
+
+	labels *map[string]string // G's pprof labels, computed on demand in Labels() method
+}
+
+// GetG returns information on the G (goroutine) that is executing on this thread.
+//
+// The G structure for a thread is stored in thread local storage. Here we simply
+// calculate the address and read and parse the G struct.
+//
+// We cannot simply use the allg linked list in order to find the M that represents
+// the given OS thread and follow its G pointer because on Darwin mach ports are not
+// universal, so our port for this thread would not map to the `id` attribute of the M
+// structure. Also, when linked against libc, Go prefers the libc version of clone as
+// opposed to the runtime version. This has the consequence of not setting M.id for
+// any thread, regardless of OS.
+//
+// In order to get around all this craziness, we read the address of the G structure for
+// the current thread from the thread local storage area.
+func GetG(thread Thread) (*G, error) {
+	if thread.Common().g != nil {
+		return thread.Common().g, nil
+	}
+	if loc, _ := thread.Location(); loc != nil && loc.Fn != nil && loc.Fn.Name == "runtime.clone" {
+		// When threads are executing runtime.clone the value of TLS is unreliable.
+		return nil, nil
+	}
+	gaddr, err := getGVariable(thread)
+	if err != nil {
+		return nil, err
+	}
+
+	g, err := gaddr.parseG()
+	if err != nil {
+		return nil, err
+	}
+	if g.ID == 0 {
+		// The runtime uses a special goroutine with ID == 0 to mark that the
+		// current goroutine is executing on the system stack (sometimes also
+		// referred to as the g0 stack or scheduler stack, I'm not sure if there's
+		// actually any difference between those).
+		// For our purposes it's better if we always return the real goroutine
+		// since the rest of the code assumes the goroutine ID is univocal.
+		// The real 'current goroutine' is stored in g0.m.curg
+		mvar, err := g.variable.structMember("m")
+		if err != nil {
+			return nil, err
+		}
+		curgvar, err := mvar.structMember("curg")
+		if err != nil {
+			return nil, err
+		}
+		g, err = curgvar.parseG()
+		if err != nil {
+			if _, ok := err.(ErrNoGoroutine); ok {
+				err = ErrNoGoroutine{thread.ThreadID()}
+			}
+			return nil, err
+		}
+		g.SystemStack = true
+	}
+	g.Thread = thread
+	if loc, err := thread.Location(); err == nil {
+		g.CurrentLoc = *loc
+	}
+	thread.Common().g = g
+	return g, nil
+}
+
+// GoroutinesInfo searches for goroutines starting at index 'start', and
+// returns an array of up to 'count' (or all found elements, if 'count' is 0)
+// G structures representing the information Delve care about from the internal
+// runtime G structure.
+// GoroutinesInfo also returns the next index to be used as 'start' argument
+// while scanning for all available goroutines, or -1 if there was an error
+// or if the index already reached the last possible value.
+func GoroutinesInfo(dbp *Target, start, count int) ([]*G, int, error) {
+	if _, err := dbp.Valid(); err != nil {
+		return nil, -1, err
+	}
+	if dbp.gcache.allGCache != nil {
+		// We can't use the cached array to fulfill a subrange request
+		if start == 0 && (count == 0 || count >= len(dbp.gcache.allGCache)) {
+			return dbp.gcache.allGCache, -1, nil
+		}
+	}
+
+	var (
+		threadg = map[int]*G{}
+		allg    []*G
+	)
+
+	threads := dbp.ThreadList()
+	for _, th := range threads {
+		if th.Blocked() {
+			continue
+		}
+		g, _ := GetG(th)
+		if g != nil {
+			threadg[g.ID] = g
+		}
+	}
+
+	allgptr, allglen, err := dbp.gcache.getRuntimeAllg(dbp.BinInfo(), dbp.CurrentThread())
+	if err != nil {
+		return nil, -1, err
+	}
+
+	for i := uint64(start); i < allglen; i++ {
+		if count != 0 && len(allg) >= count {
+			return allg, int(i), nil
+		}
+		gvar, err := newGVariable(dbp.CurrentThread(), uintptr(allgptr+(i*uint64(dbp.BinInfo().Arch.PtrSize()))), true)
+		if err != nil {
+			allg = append(allg, &G{Unreadable: err})
+			continue
+		}
+		g, err := gvar.parseG()
+		if err != nil {
+			allg = append(allg, &G{Unreadable: err})
+			continue
+		}
+		if thg, allocated := threadg[g.ID]; allocated {
+			loc, err := thg.Thread.Location()
+			if err != nil {
+				return nil, -1, err
+			}
+			g.Thread = thg.Thread
+			// Prefer actual thread location information.
+			g.CurrentLoc = *loc
+			g.SystemStack = thg.SystemStack
+		}
+		if g.Status != Gdead {
+			allg = append(allg, g)
+		}
+		dbp.gcache.addGoroutine(g)
+	}
+	if start == 0 {
+		dbp.gcache.allGCache = allg
+	}
+
+	return allg, -1, nil
+}
+
+// FindGoroutine returns a G struct representing the goroutine
+// specified by `gid`.
+func FindGoroutine(dbp *Target, gid int) (*G, error) {
+	if selg := dbp.SelectedGoroutine(); (gid == -1) || (selg != nil && selg.ID == gid) || (selg == nil && gid == 0) {
+		// Return the currently selected goroutine in the following circumstances:
+		//
+		// 1. if the caller asks for gid == -1 (because that's what a goroutine ID of -1 means in our API).
+		// 2. if gid == selg.ID.
+		//    this serves two purposes: (a) it's an optimizations that allows us
+		//    to avoid reading any other goroutine and, more importantly, (b) we
+		//    could be reading an incorrect value for the goroutine ID of a thread.
+		//    This condition usually happens when a goroutine calls runtime.clone
+		//    and for a short period of time two threads will appear to be running
+		//    the same goroutine.
+		// 3. if the caller asks for gid == 0 and the selected goroutine is
+		//    either 0 or nil.
+		//    Goroutine 0 is special, it either means we have no current goroutine
+		//    (for example, running C code), or that we are running on a speical
+		//    stack (system stack, signal handling stack) and we didn't properly
+		//    detect it.
+		//    Since there could be multiple goroutines '0' running simultaneously
+		//    if the user requests it return the one that's already selected or
+		//    nil if there isn't a selected goroutine.
+		return selg, nil
+	}
+
+	if gid == 0 {
+		return nil, fmt.Errorf("unknown goroutine %d", gid)
+	}
+
+	// Calling GoroutinesInfo could be slow if there are many goroutines
+	// running, check if a running goroutine has been requested first.
+	for _, thread := range dbp.ThreadList() {
+		g, _ := GetG(thread)
+		if g != nil && g.ID == gid {
+			return g, nil
+		}
+	}
+
+	if g := dbp.gcache.partialGCache[gid]; g != nil {
+		return g, nil
+	}
+
+	const goroutinesInfoLimit = 10
+	nextg := 0
+	for nextg >= 0 {
+		var gs []*G
+		var err error
+		gs, nextg, err = GoroutinesInfo(dbp, nextg, goroutinesInfoLimit)
+		if err != nil {
+			return nil, err
+		}
+		for i := range gs {
+			if gs[i].ID == gid {
+				if gs[i].Unreadable != nil {
+					return nil, gs[i].Unreadable
+				}
+				return gs[i], nil
+			}
+		}
+	}
+
+	return nil, fmt.Errorf("unknown goroutine %d", gid)
+}
+
+func getGVariable(thread Thread) (*Variable, error) {
+	regs, err := thread.Registers(false)
+	if err != nil {
+		return nil, err
+	}
+
+	gaddr, hasgaddr := regs.GAddr()
+	if !hasgaddr {
+		var err error
+		gaddr, err = readUintRaw(thread, uintptr(regs.TLS()+thread.BinInfo().GStructOffset()), int64(thread.BinInfo().Arch.PtrSize()))
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	return newGVariable(thread, uintptr(gaddr), thread.BinInfo().Arch.DerefTLS())
+}
+
+func newGVariable(thread Thread, gaddr uintptr, deref bool) (*Variable, error) {
+	typ, err := thread.BinInfo().findType("runtime.g")
+	if err != nil {
+		return nil, err
+	}
+
+	if deref {
+		typ = &godwarf.PtrType{
+			CommonType: godwarf.CommonType{
+				ByteSize:    int64(thread.BinInfo().Arch.PtrSize()),
+				Name:        "",
+				ReflectKind: reflect.Ptr,
+				Offset:      0,
+			},
+			Type: typ,
+		}
+	}
+
+	return newVariableFromThread(thread, "", gaddr, typ), nil
 }
 
 // Defer returns the top-most defer of the goroutine.
@@ -217,7 +461,11 @@ func (g *G) Defer() *Defer {
 	if g.variable.Unreadable != nil {
 		return nil
 	}
-	dvar := g.variable.fieldVariable("_defer").maybeDereference()
+	dvar, _ := g.variable.structMember("_defer")
+	if dvar == nil {
+		return nil
+	}
+	dvar = dvar.maybeDereference()
 	if dvar.Addr == 0 {
 		return nil
 	}
@@ -237,7 +485,7 @@ func (g *G) UserCurrent() Location {
 		frame := it.Frame()
 		if frame.Call.Fn != nil {
 			name := frame.Call.Fn.Name
-			if strings.Contains(name, ".") && (!strings.HasPrefix(name, "runtime.") || isExportedRuntime(name)) {
+			if strings.Contains(name, ".") && (!strings.HasPrefix(name, "runtime.") || frame.Call.Fn.exportedRuntime()) {
 				return frame.Call
 			}
 		}
@@ -264,6 +512,32 @@ func (g *G) Go() Location {
 func (g *G) StartLoc() Location {
 	f, l, fn := g.variable.bi.PCToLine(g.StartPC)
 	return Location{PC: g.StartPC, File: f, Line: l, Fn: fn}
+}
+
+func (g *G) Labels() map[string]string {
+	if g.labels != nil {
+		return *g.labels
+	}
+	var labels map[string]string
+	if labelsVar := g.variable.loadFieldNamed("labels"); labelsVar != nil && len(labelsVar.Children) == 1 {
+		if address := labelsVar.Children[0]; address.Addr != 0 {
+			labelMapType, _ := g.variable.bi.findType("runtime/pprof.labelMap")
+			if labelMapType != nil {
+				labelMap := newVariable("", address.Addr, labelMapType, g.variable.bi, g.variable.mem)
+				labelMap.loadValue(loadFullValue)
+				labels = map[string]string{}
+				for i := range labelMap.Children {
+					if i%2 == 0 {
+						k := labelMap.Children[i]
+						v := labelMap.Children[i+1]
+						labels[constant.StringVal(k.Value)] = constant.StringVal(v.Value)
+					}
+				}
+			}
+		}
+	}
+	g.labels = &labels
+	return *g.labels
 }
 
 type Ancestor struct {
@@ -396,7 +670,7 @@ func newVariable(name string, addr uintptr, dwarfType godwarf.Type, bi *BinaryIn
 	case *godwarf.UnspecifiedType:
 		v.Kind = reflect.Invalid
 	default:
-		v.Unreadable = fmt.Errorf("Unknown type: %T", t)
+		v.Unreadable = fmt.Errorf("unknown type: %T", t)
 	}
 
 	return v
@@ -489,18 +763,19 @@ func (ng ErrNoGoroutine) Error() string {
 	return fmt.Sprintf("no G executing on thread %d", ng.tid)
 }
 
+var ErrUnreadableG = errors.New("could not read G struct")
+
 func (v *Variable) parseG() (*G, error) {
 	mem := v.mem
 	gaddr := uint64(v.Addr)
 	_, deref := v.RealType.(*godwarf.PtrType)
 
 	if deref {
-		gaddrbytes := make([]byte, v.bi.Arch.PtrSize())
-		_, err := mem.ReadMemory(gaddrbytes, uintptr(gaddr))
+		var err error
+		gaddr, err = readUintRaw(mem, uintptr(gaddr), int64(v.bi.Arch.PtrSize()))
 		if err != nil {
 			return nil, fmt.Errorf("error derefing *G %s", err)
 		}
-		gaddr = binary.LittleEndian.Uint64(gaddrbytes)
 	}
 	if gaddr == 0 {
 		id := 0
@@ -515,32 +790,40 @@ func (v *Variable) parseG() (*G, error) {
 		}
 		v = v.maybeDereference()
 	}
-	v.loadValue(LoadConfig{false, 2, 64, 0, -1, 0})
-	if v.Unreadable != nil {
-		return nil, v.Unreadable
+
+	v.mem = cacheMemory(v.mem, v.Addr, int(v.RealType.Size()))
+
+	schedVar := v.loadFieldNamed("sched")
+	if schedVar == nil {
+		return nil, ErrUnreadableG
 	}
-	schedVar := v.fieldVariable("sched")
 	pc, _ := constant.Int64Val(schedVar.fieldVariable("pc").Value)
 	sp, _ := constant.Int64Val(schedVar.fieldVariable("sp").Value)
-	var bp int64
+	var bp, lr int64
 	if bpvar := schedVar.fieldVariable("bp"); bpvar != nil && bpvar.Value != nil {
 		bp, _ = constant.Int64Val(bpvar.Value)
 	}
-	id, _ := constant.Int64Val(v.fieldVariable("goid").Value)
-	gopc, _ := constant.Int64Val(v.fieldVariable("gopc").Value)
-	startpc, _ := constant.Int64Val(v.fieldVariable("startpc").Value)
-	waitReason := ""
-	if wrvar := v.fieldVariable("waitreason"); wrvar.Value != nil {
-		switch wrvar.Kind {
-		case reflect.String:
-			waitReason = constant.StringVal(wrvar.Value)
-		case reflect.Uint:
-			waitReason = wrvar.ConstDescr()
-		}
-
+	if bpvar := schedVar.fieldVariable("lr"); bpvar != nil && bpvar.Value != nil {
+		lr, _ = constant.Int64Val(bpvar.Value)
 	}
+
+	unreadable := false
+
+	loadInt64Maybe := func(name string) int64 {
+		vv := v.loadFieldNamed(name)
+		if vv == nil {
+			unreadable = true
+			return 0
+		}
+		n, _ := constant.Int64Val(vv.Value)
+		return n
+	}
+
+	id := loadInt64Maybe("goid")
+	gopc := loadInt64Maybe("gopc")
+	startpc := loadInt64Maybe("startpc")
 	var stackhi, stacklo uint64
-	if stackVar := v.fieldVariable("stack"); stackVar != nil {
+	if stackVar := v.loadFieldNamed("stack"); stackVar != nil {
 		if stackhiVar := stackVar.fieldVariable("hi"); stackhiVar != nil {
 			stackhi, _ = constant.Uint64Val(stackhiVar.Value)
 		}
@@ -549,15 +832,23 @@ func (v *Variable) parseG() (*G, error) {
 		}
 	}
 
-	stkbarVar, _ := v.structMember("stkbar")
-	stkbarVarPosFld := v.fieldVariable("stkbarPos")
+	stkbarVar := v.loadFieldNamed("stkbar")
+	stkbarVarPosFld := v.loadFieldNamed("stkbarPos")
 	var stkbarPos int64
 	if stkbarVarPosFld != nil { // stack barriers were removed in Go 1.9
 		stkbarPos, _ = constant.Int64Val(stkbarVarPosFld.Value)
 	}
 
-	status, _ := constant.Int64Val(v.fieldVariable("atomicstatus").Value)
+	status := loadInt64Maybe("atomicstatus")
+
+	if unreadable {
+		return nil, ErrUnreadableG
+	}
+
 	f, l, fn := v.bi.PCToLine(uint64(pc))
+
+	v.Name = "runtime.curg"
+
 	g := &G{
 		ID:         int(id),
 		GoPC:       uint64(gopc),
@@ -565,7 +856,7 @@ func (v *Variable) parseG() (*G, error) {
 		PC:         uint64(pc),
 		SP:         uint64(sp),
 		BP:         uint64(bp),
-		WaitReason: waitReason,
+		LR:         uint64(lr),
 		Status:     uint64(status),
 		CurrentLoc: Location{PC: uint64(pc), File: f, Line: l, Fn: fn},
 		variable:   v,
@@ -590,20 +881,15 @@ func (v *Variable) loadFieldNamed(name string) *Variable {
 }
 
 func (v *Variable) fieldVariable(name string) *Variable {
+	if !v.loaded {
+		panic("fieldVariable called on a variable that wasn't loaded")
+	}
 	for i := range v.Children {
 		if child := &v.Children[i]; child.Name == name {
 			return child
 		}
 	}
 	return nil
-}
-
-// From $GOROOT/src/runtime/traceback.go:597
-// isExportedRuntime reports whether name is an exported runtime function.
-// It is only for runtime functions, so ASCII A-Z is fine.
-func isExportedRuntime(name string) bool {
-	const n = len("runtime.")
-	return len(name) > n && name[:n] == "runtime." && 'A' <= name[n] && name[n] <= 'Z'
 }
 
 var errTracebackAncestorsDisabled = errors.New("tracebackancestors is disabled")
@@ -791,39 +1077,28 @@ func (v *Variable) structMember(memberName string) (*Variable, error) {
 	}
 }
 
-func readVarEntry(varEntry *dwarf.Entry, image *Image) (entry reader.Entry, name string, typ godwarf.Type, err error) {
-	entry, _ = reader.LoadAbstractOrigin(varEntry, image.dwarfReader)
-
+func readVarEntry(entry *godwarf.Tree, image *Image) (name string, typ godwarf.Type, err error) {
 	name, ok := entry.Val(dwarf.AttrName).(string)
 	if !ok {
-		return nil, "", nil, fmt.Errorf("malformed variable DIE (name)")
+		return "", nil, fmt.Errorf("malformed variable DIE (name)")
 	}
 
-	offset, ok := entry.Val(dwarf.AttrType).(dwarf.Offset)
-	if !ok {
-		return nil, "", nil, fmt.Errorf("malformed variable DIE (offset)")
-	}
-
-	typ, err = image.Type(offset)
+	typ, err = entry.Type(image.dwarf, image.index, image.typeCache)
 	if err != nil {
-		return nil, "", nil, err
+		return "", nil, err
 	}
 
-	return entry, name, typ, nil
+	return name, typ, nil
 }
 
 // Extracts the name and type of a variable from a dwarf entry
 // then executes the instructions given in the  DW_AT_location attribute to grab the variable's address
-func extractVarInfoFromEntry(bi *BinaryInfo, image *Image, regs op.DwarfRegisters, mem MemoryReadWriter, varEntry *dwarf.Entry) (*Variable, error) {
-	if varEntry == nil {
-		return nil, fmt.Errorf("invalid entry")
+func extractVarInfoFromEntry(bi *BinaryInfo, image *Image, regs op.DwarfRegisters, mem MemoryReadWriter, entry *godwarf.Tree) (*Variable, error) {
+	if entry.Tag != dwarf.TagFormalParameter && entry.Tag != dwarf.TagVariable {
+		return nil, fmt.Errorf("invalid entry tag, only supports FormalParameter and Variable, got %s", entry.Tag.String())
 	}
 
-	if varEntry.Tag != dwarf.TagFormalParameter && varEntry.Tag != dwarf.TagVariable {
-		return nil, fmt.Errorf("invalid entry tag, only supports FormalParameter and Variable, got %s", varEntry.Tag.String())
-	}
-
-	entry, n, t, err := readVarEntry(varEntry, image)
+	n, t, err := readVarEntry(entry, image)
 	if err != nil {
 		return nil, err
 	}
@@ -1020,33 +1295,30 @@ func convertToEface(srcv, dstv *Variable) error {
 	return dstv.writeEmptyInterface(typeAddr, srcv)
 }
 
-func readStringInfo(mem MemoryReadWriter, arch Arch, addr uintptr) (uintptr, int64, error) {
+func readStringInfo(mem MemoryReadWriter, arch *Arch, addr uintptr) (uintptr, int64, error) {
 	// string data structure is always two ptrs in size. Addr, followed by len
 	// http://research.swtch.com/godata
 
 	mem = cacheMemory(mem, addr, arch.PtrSize()*2)
 
 	// read len
-	val := make([]byte, arch.PtrSize())
-	_, err := mem.ReadMemory(val, addr+uintptr(arch.PtrSize()))
+	strlen, err := readIntRaw(mem, addr+uintptr(arch.PtrSize()), int64(arch.PtrSize()))
 	if err != nil {
 		return 0, 0, fmt.Errorf("could not read string len %s", err)
 	}
-	strlen := int64(binary.LittleEndian.Uint64(val))
 	if strlen < 0 {
 		return 0, 0, fmt.Errorf("invalid length: %d", strlen)
 	}
 
 	// read addr
-	_, err = mem.ReadMemory(val, addr)
+	val, err := readUintRaw(mem, addr, int64(arch.PtrSize()))
 	if err != nil {
 		return 0, 0, fmt.Errorf("could not read string pointer %s", err)
 	}
-	addr = uintptr(binary.LittleEndian.Uint64(val))
+	addr = uintptr(val)
 	if addr == 0 {
 		return 0, 0, nil
 	}
-
 	return addr, strlen, nil
 }
 
@@ -1423,14 +1695,13 @@ func (v *Variable) readFunctionPtr() {
 		return
 	}
 
-	val := make([]byte, v.bi.Arch.PtrSize())
-	_, err := v.mem.ReadMemory(val, uintptr(v.closureAddr))
+	val, err := readUintRaw(v.mem, uintptr(v.closureAddr), int64(v.bi.Arch.PtrSize()))
 	if err != nil {
 		v.Unreadable = err
 		return
 	}
 
-	v.Base = uintptr(binary.LittleEndian.Uint64(val))
+	v.Base = uintptr(val)
 	fn := v.bi.PCToFunc(uint64(v.Base))
 	if fn == nil {
 		v.Unreadable = fmt.Errorf("could not find function for %#v", v.Base)
@@ -1442,13 +1713,12 @@ func (v *Variable) readFunctionPtr() {
 
 // funcvalAddr reads the address of the funcval contained in a function variable.
 func (v *Variable) funcvalAddr() uint64 {
-	val := make([]byte, v.bi.Arch.PtrSize())
-	_, err := v.mem.ReadMemory(val, v.Addr)
+	val, err := readUintRaw(v.mem, v.Addr, int64(v.bi.Arch.PtrSize()))
 	if err != nil {
 		v.Unreadable = err
 		return 0
 	}
-	return binary.LittleEndian.Uint64(val)
+	return val
 }
 
 func (v *Variable) loadMap(recurseLevel int, cfg LoadConfig) {
@@ -1484,8 +1754,7 @@ func (v *Variable) loadMap(recurseLevel int, cfg LoadConfig) {
 		if key.Unreadable != nil || val.Unreadable != nil {
 			errcount++
 		}
-		v.Children = append(v.Children, *key)
-		v.Children = append(v.Children, *val)
+		v.Children = append(v.Children, *key, *val)
 		count++
 		if errcount > maxErrCount {
 			break

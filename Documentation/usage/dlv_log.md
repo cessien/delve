@@ -17,6 +17,7 @@ names selected from this list:
 	lldbout		Copy output from debugserver/lldb to standard output
 	debuglineerr	Log recoverable errors reading .debug_line
 	rpc		Log all RPC messages
+	dap		Log all DAP messages
 	fncall		Log function call protocol
 	minidump	Log minidump loading
 
@@ -24,8 +25,8 @@ Additionally --log-dest can be used to specify where the logs should be
 written. 
 If the argument is a number it will be interpreted as a file descriptor,
 otherwise as a file path.
-This option will also redirect the \"API listening\" message in headless
-mode.
+This option will also redirect the "server listening at" message in headless
+and dap modes.
 
 
 
@@ -43,6 +44,7 @@ mode.
       --log                  Enable debugging server logging.
       --log-dest string      Writes logs to the specified file or file descriptor (see 'dlv help log').
       --log-output string    Comma separated list of components that should produce debug output (see 'dlv help log')
+      --only-same-user       Only connections from the same user that started this instance of Delve are allowed to connect. (default true)
       --wd string            Working directory for running the program. (default ".")
 ```
 

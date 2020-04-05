@@ -1,53 +1,93 @@
+# Configuration and Command History
+
+If `$XDG_CONFIG_HOME` is set, then configuration and command history files are located in `$XDG_CONFIG_HOME/dlv`. Otherwise, they are located in `$HOME/.config/dlv` on Linux and `$HOME/.dlv` on other systems.
+
+The configuration file `config.yml` contains all the configurable options and their default values. The command history is stored in `.dbg_history`.
+
 # Commands
+
+## Running the program
+
+Command | Description
+--------|------------
+[call](#call) | Resumes process, injecting a function call (EXPERIMENTAL!!!)
+[continue](#continue) | Run until breakpoint or program termination.
+[next](#next) | Step over to next source line.
+[restart](#restart) | Restart process.
+[rev](#rev) | Reverses the execution of the target program for the command specified.
+[rewind](#rewind) | Run backwards until breakpoint or program termination.
+[step](#step) | Single step through program.
+[step-instruction](#step-instruction) | Single step a single cpu instruction.
+[stepout](#stepout) | Step out of the current function.
+
+
+## Manipulating breakpoints
+
+Command | Description
+--------|------------
+[break](#break) | Sets a breakpoint.
+[breakpoints](#breakpoints) | Print out info for active breakpoints.
+[clear](#clear) | Deletes breakpoint.
+[clearall](#clearall) | Deletes multiple breakpoints.
+[condition](#condition) | Set breakpoint condition.
+[on](#on) | Executes a command when a breakpoint is hit.
+[trace](#trace) | Set tracepoint.
+
+
+## Viewing program variables and memory
 
 Command | Description
 --------|------------
 [args](#args) | Print function arguments.
-[break](#break) | Sets a breakpoint.
-[breakpoints](#breakpoints) | Print out info for active breakpoints.
-[call](#call) | Resumes process, injecting a function call (EXPERIMENTAL!!!)
-[check](#check) | Creates a checkpoint at the current position.
-[checkpoints](#checkpoints) | Print out info for existing checkpoints.
-[clear](#clear) | Deletes breakpoint.
-[clear-checkpoint](#clear-checkpoint) | Deletes checkpoint.
-[clearall](#clearall) | Deletes multiple breakpoints.
-[condition](#condition) | Set breakpoint condition.
-[config](#config) | Changes configuration parameters.
-[continue](#continue) | Run until breakpoint or program termination.
-[deferred](#deferred) | Executes command in the context of a deferred call.
-[disassemble](#disassemble) | Disassembler.
-[down](#down) | Move the current frame down.
-[edit](#edit) | Open where you are in $DELVE_EDITOR or $EDITOR
-[exit](#exit) | Exit the debugger.
-[frame](#frame) | Set the current frame, or execute command on a different frame.
-[funcs](#funcs) | Print list of functions.
+[display](#display) | Print value of an expression every time the program stops.
+[examinemem](#examinemem) | Examine memory:
+[locals](#locals) | Print local variables.
+[print](#print) | Evaluate an expression.
+[regs](#regs) | Print contents of CPU registers.
+[set](#set) | Changes the value of a variable.
+[vars](#vars) | Print package variables.
+[whatis](#whatis) | Prints type of an expression.
+
+
+## Listing and switching between threads and goroutines
+
+Command | Description
+--------|------------
 [goroutine](#goroutine) | Shows or changes current goroutine
 [goroutines](#goroutines) | List program goroutines.
+[thread](#thread) | Switch to the specified thread.
+[threads](#threads) | Print out info for every traced thread.
+
+
+## Viewing the call stack and selecting frames
+
+Command | Description
+--------|------------
+[deferred](#deferred) | Executes command in the context of a deferred call.
+[down](#down) | Move the current frame down.
+[frame](#frame) | Set the current frame, or execute command on a different frame.
+[stack](#stack) | Print stack trace.
+[up](#up) | Move the current frame up.
+
+
+## Other commands
+
+Command | Description
+--------|------------
+[check](#check) | Creates a checkpoint at the current position.
+[checkpoints](#checkpoints) | Print out info for existing checkpoints.
+[clear-checkpoint](#clear-checkpoint) | Deletes checkpoint.
+[config](#config) | Changes configuration parameters.
+[disassemble](#disassemble) | Disassembler.
+[edit](#edit) | Open where you are in $DELVE_EDITOR or $EDITOR
+[exit](#exit) | Exit the debugger.
+[funcs](#funcs) | Print list of functions.
 [help](#help) | Prints the help message.
 [libraries](#libraries) | List loaded dynamic libraries
 [list](#list) | Show source code.
-[locals](#locals) | Print local variables.
-[next](#next) | Step over to next source line.
-[on](#on) | Executes a command when a breakpoint is hit.
-[print](#print) | Evaluate an expression.
-[regs](#regs) | Print contents of CPU registers.
-[restart](#restart) | Restart process from a checkpoint or event.
-[rev](#rev) | Reverses the execution of the target program for the command specified.
-[rewind](#rewind) | Run backwards until breakpoint or program termination.
-[set](#set) | Changes the value of a variable.
 [source](#source) | Executes a file containing a list of delve commands
 [sources](#sources) | Print list of source files.
-[stack](#stack) | Print stack trace.
-[step](#step) | Single step through program.
-[step-instruction](#step-instruction) | Single step a single cpu instruction.
-[stepout](#stepout) | Step out of the current function.
-[thread](#thread) | Switch to the specified thread.
-[threads](#threads) | Print out info for every traced thread.
-[trace](#trace) | Set tracepoint.
 [types](#types) | Print list of types
-[up](#up) | Move the current frame up.
-[vars](#vars) | Print package variables.
-[whatis](#whatis) | Prints type of an expression.
 
 ## args
 Print function arguments.
@@ -186,6 +226,17 @@ If no argument is specified the function being executed in the selected stack fr
 
 Aliases: disass
 
+## display
+Print value of an expression every time the program stops.
+
+	display -a <expression>
+	display -d <number>
+
+The '-a' option adds an expression to the list of expression printed every time the program stops. The '-d' option removes the specified expression from the list.
+
+If display is called without arguments it will print the value of all expression in the list.
+
+
 ## down
 Move the current frame down.
 
@@ -203,6 +254,21 @@ Open where you are in $DELVE_EDITOR or $EDITOR
 If locspec is omitted edit will open the current source file in the editor, otherwise it will open the specified location.
 
 Aliases: ed
+
+## examinemem
+Examine memory:
+
+	examinemem [-fmt <format>] [-len <length>] <address>
+
+Format represents the data format and the value is one of this list (default hex): bin(binary), oct(octal), dec(decimal), hex(hexadecimal),.
+Length is the number of bytes (default 1) and must be less than or equal to 1000.
+Address is the memory location of the target to examine.
+
+For example:
+
+    x -fmt hex -len 20 0xc00008af38
+
+Aliases: x
 
 ## exit
 Exit the debugger.
@@ -247,7 +313,7 @@ Aliases: gr
 ## goroutines
 List program goroutines.
 
-	goroutines [-u (default: user location)|-r (runtime location)|-g (go statement location)|-s (start location)] [ -t (stack trace)]
+	goroutines [-u (default: user location)|-r (runtime location)|-g (go statement location)|-s (start location)] [-t (stack trace)] [-l (labels)]
 
 Print out info for every goroutine. The flag controls what information is shown along with each goroutine:
 
@@ -255,7 +321,8 @@ Print out info for every goroutine. The flag controls what information is shown 
 	-r	displays location of topmost stackframe (including frames inside private runtime functions)
 	-g	displays location of go instruction that created the goroutine
 	-s	displays location of the start function
-	-t	displays stack trace of goroutine
+	-t	displays goroutine's stacktrace
+	-l	displays goroutine's labels
 
 If no flag is specified the default is -u.
 
@@ -329,9 +396,21 @@ Argument -a shows more registers.
 
 
 ## restart
-Restart process from a checkpoint or event.
+Restart process.
 
-  restart [event number or checkpoint id]
+For recorded targets the command takes the following forms:
+
+	restart				resets ot the start of the recording
+	restart [checkpoint]		resets the recording to the given checkpoint
+	restart -r [newargv...]		re-records the target process
+	
+For live targets the command takes the following forms:
+
+	restart [newargv...]		restarts the process
+
+If newargv is omitted the process is restarted (or re-recorded) with the same argument vector.
+If -noargs is specified instead, the argument vector is cleared.
+
 
 Aliases: r
 

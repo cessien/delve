@@ -138,8 +138,7 @@ func readRegex(in string) (rx string, rest string) {
 			if ch == '/' {
 				out = append(out, '/')
 			} else {
-				out = append(out, '\\')
-				out = append(out, ch)
+				out = append(out, '\\', ch)
 			}
 			escaped = false
 		} else {
@@ -275,7 +274,7 @@ func (loc *AddrLocationSpec) Find(d *Debugger, scope *proc.EvalScope, locStr str
 		}
 		return []api.Location{{PC: uint64(addr)}}, nil
 	} else {
-		v, err := scope.EvalExpression(loc.AddrExpr, proc.LoadConfig{true, 0, 0, 0, 0, 0})
+		v, err := scope.EvalExpression(loc.AddrExpr, proc.LoadConfig{FollowPointers: true})
 		if err != nil {
 			return nil, err
 		}
@@ -287,7 +286,7 @@ func (loc *AddrLocationSpec) Find(d *Debugger, scope *proc.EvalScope, locStr str
 			addr, _ := constant.Uint64Val(v.Value)
 			return []api.Location{{PC: addr}}, nil
 		case reflect.Func:
-			_, _, fn := d.target.BinInfo().PCToLine(uint64(v.Base))
+			fn := d.target.BinInfo().PCToFunc(uint64(v.Base))
 			pc, err := proc.FirstPCAfterPrologue(d.target, fn, false)
 			if err != nil {
 				return nil, err

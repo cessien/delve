@@ -95,7 +95,7 @@ func configureList(t *Term) error {
 }
 
 func configureSet(t *Term, args string) error {
-	v := strings.SplitN(args, " ", 2)
+	v := split2PartsBySpace(args)
 
 	cfgname := v[0]
 	var rest string
@@ -170,7 +170,7 @@ func configureSetSubstitutePath(t *Term, rest string) error {
 				return nil
 			}
 		}
-		t.conf.SubstitutePath = append(t.conf.SubstitutePath, config.SubstitutePathRule{argv[0], argv[1]})
+		t.conf.SubstitutePath = append(t.conf.SubstitutePath, config.SubstitutePathRule{From: argv[0], To: argv[1]})
 	default:
 		return fmt.Errorf("too many arguments to \"config substitute-path\"")
 	}

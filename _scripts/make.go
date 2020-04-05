@@ -8,14 +8,17 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 
+	"github.com/go-delve/delve/pkg/goversion"
 	"github.com/spf13/cobra"
 )
 
 const DelveMainPackagePath = "github.com/go-delve/delve/cmd/dlv"
 
 var Verbose bool
+var NOTimeout bool
 var TestSet, TestRegex, TestBackend, TestBuildMode string
 
 func NewMakeCommands() *cobra.Command {
@@ -69,17 +72,18 @@ func NewMakeCommands() *cobra.Command {
 
 Use the flags -s, -r and -b to specify which tests to run. Specifying nothing is equivalent to:
 
-	go run scripts/make.go test -s all -b default
-	go run scripts/make.go test -s basic -b lldb    # if lldb-server is installed
-	go run scripts/make.go test -s basic -b rr      # if rr is installed
+	go run _scripts/make.go test -s all -b default
+	go run _scripts/make.go test -s basic -b lldb    # if lldb-server is installed and Go < 1.14
+	go run _scripts/make.go test -s basic -b rr      # if rr is installed
 	
-	go run scripts/make.go test -s basic -m pie     # only on linux
-	go run scripts/make.go test -s core -m pie      # only on linux
-	go run scripts/make.go test -s 
+	go run _scripts/make.go test -s basic -m pie     # only on linux
+	go run _scripts/make.go test -s core -m pie      # only on linux
+	go run _scripts/make.go test -s 
 `,
 		Run: testCmd,
 	}
 	test.PersistentFlags().BoolVarP(&Verbose, "verbose", "v", false, "Verbose tests")
+	test.PersistentFlags().BoolVarP(&NOTimeout, "timeout", "t", false, "Set infinite timeouts")
 	test.PersistentFlags().StringVarP(&TestSet, "test-set", "s", "", `Select the set of tests to run, one of either:
 	all		tests all packages
 	basic		tests proc, integration and terminal
@@ -118,7 +122,7 @@ func checkCert() bool {
 		return true
 	}
 
-	x := exec.Command("scripts/gencert.sh")
+	x := exec.Command("_scripts/gencert.sh")
 	x.Stdout = os.Stdout
 	x.Stderr = os.Stderr
 	x.Env = os.Environ()
@@ -189,9 +193,11 @@ func getoutput(cmd string, args ...interface{}) string {
 	x.Env = os.Environ()
 	out, err := x.Output()
 	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error executing %s %v\n", cmd, args)
 		log.Fatal(err)
 	}
 	if !x.ProcessState.Success() {
+		fmt.Fprintf(os.Stderr, "Error executing %s %v\n", cmd, args)
 		os.Exit(1)
 	}
 	return string(out)
@@ -219,7 +225,18 @@ func canMacnative() bool {
 	if strings.TrimSpace(getoutput("go", "env", "CGO_ENABLED")) != "1" {
 		return false
 	}
-	_, err := os.Stat("/usr/include/sys/types.h")
+
+	macOSVersion := strings.Split(strings.TrimSpace(getoutput("/usr/bin/sw_vers", "-productVersion")), ".")
+	minor, err := strconv.ParseInt(macOSVersion[1], 10, 64)
+	if err != nil {
+		return false
+	}
+
+	typesHeader := "/usr/include/sys/types.h"
+	if minor >= 15 {
+		typesHeader = "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/sys/types.h"
+	}
+	_, err = os.Stat(typesHeader)
 	if err != nil {
 		return false
 	}
@@ -259,8 +276,11 @@ func testFlags() []string {
 	if Verbose {
 		testFlags = append(testFlags, "-v")
 	}
+	if NOTimeout {
+		testFlags = append(testFlags, "-timeout", "0")
+	}
 	if runtime.GOOS == "darwin" {
-		testFlags = append(testFlags, "-exec="+wd+"/scripts/testsign")
+		testFlags = append(testFlags, "-exec="+wd+"/_scripts/testsign")
 	}
 	return testFlags
 }
@@ -289,7 +309,7 @@ func testCmd(cmd *cobra.Command, args []string) {
 
 		fmt.Println("Testing default backend")
 		testCmdIntl("all", "", "default", "normal")
-		if inpath("lldb-server") {
+		if inpath("lldb-server") && !goversion.VersionAfterOrEqual(runtime.Version(), 1, 14) {
 			fmt.Println("\nTesting LLDB backend")
 			testCmdIntl("basic", "", "lldb", "normal")
 		}
@@ -398,9 +418,9 @@ func inpath(exe string) bool {
 
 func allPackages() []string {
 	r := []string{}
-	for _, dir := range strings.Split(getoutput("go", "list", "./..."), "\n") {
+	for _, dir := range strings.Split(getoutput("go", "list", "-mod=vendor", "./..."), "\n") {
 		dir = strings.TrimSpace(dir)
-		if dir == "" || strings.Contains(dir, "/vendor/") || strings.Contains(dir, "/scripts") {
+		if dir == "" || strings.Contains(dir, "/vendor/") || strings.Contains(dir, "/_scripts") {
 			continue
 		}
 		r = append(r, dir)
@@ -410,5 +430,6 @@ func allPackages() []string {
 }
 
 func main() {
+	allPackages() // checks that vendor directory is synced as a side effect
 	NewMakeCommands().Execute()
 }

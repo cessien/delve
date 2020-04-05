@@ -10,6 +10,7 @@ import (
 	"strconv"
 
 	"github.com/go-delve/delve/pkg/dwarf/godwarf"
+	"github.com/go-delve/delve/pkg/dwarf/op"
 	"github.com/go-delve/delve/pkg/proc"
 )
 
@@ -147,7 +148,7 @@ func ConvertVar(v *proc.Variable) *Variable {
 		Flags:    VariableFlags(v.Flags),
 		Base:     v.Base,
 
-		LocationExpr: v.LocationExpr,
+		LocationExpr: v.LocationExpr.String(),
 		DeclLine:     v.DeclLine,
 	}
 
@@ -263,6 +264,7 @@ func ConvertGoroutine(g *proc.G) *Goroutine {
 		GoStatementLoc: ConvertLocation(g.Go()),
 		StartLoc:       ConvertLocation(g.StartLoc()),
 		ThreadID:       tid,
+		Labels:         g.Labels(),
 	}
 	if g.Unreadable != nil {
 		r.Unreadable = g.Unreadable.Error()
@@ -303,12 +305,12 @@ func LoadConfigToProc(cfg *LoadConfig) *proc.LoadConfig {
 		return nil
 	}
 	return &proc.LoadConfig{
-		cfg.FollowPointers,
-		cfg.MaxVariableRecurse,
-		cfg.MaxStringLen,
-		cfg.MaxArrayValues,
-		cfg.MaxStructFields,
-		0, // MaxMapBuckets is set internally by pkg/proc, read its documentation for an explanation.
+		FollowPointers:     cfg.FollowPointers,
+		MaxVariableRecurse: cfg.MaxVariableRecurse,
+		MaxStringLen:       cfg.MaxStringLen,
+		MaxArrayValues:     cfg.MaxArrayValues,
+		MaxStructFields:    cfg.MaxStructFields,
+		MaxMapBuckets:      0, // MaxMapBuckets is set internally by pkg/proc, read its documentation for an explanation.
 	}
 }
 
@@ -318,19 +320,27 @@ func LoadConfigFromProc(cfg *proc.LoadConfig) *LoadConfig {
 		return nil
 	}
 	return &LoadConfig{
-		cfg.FollowPointers,
-		cfg.MaxVariableRecurse,
-		cfg.MaxStringLen,
-		cfg.MaxArrayValues,
-		cfg.MaxStructFields,
+		FollowPointers:     cfg.FollowPointers,
+		MaxVariableRecurse: cfg.MaxVariableRecurse,
+		MaxStringLen:       cfg.MaxStringLen,
+		MaxArrayValues:     cfg.MaxArrayValues,
+		MaxStructFields:    cfg.MaxStructFields,
 	}
 }
 
 // ConvertRegisters converts proc.Register to api.Register for a slice.
-func ConvertRegisters(in []proc.Register) (out []Register) {
-	out = make([]Register, len(in))
-	for i := range in {
-		out[i] = Register{in[i].Name, in[i].Value}
+func ConvertRegisters(in op.DwarfRegisters, arch *proc.Arch, floatingPoint bool) (out []Register) {
+	out = make([]Register, 0, len(in.Regs))
+	for i := range in.Regs {
+		reg := in.Reg(uint64(i))
+		if reg == nil {
+			continue
+		}
+		name, fp, repr := arch.DwarfRegisterToString(i, reg)
+		if !floatingPoint && fp {
+			continue
+		}
+		out = append(out, Register{name, repr, i})
 	}
 	return
 }

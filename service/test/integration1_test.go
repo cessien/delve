@@ -154,19 +154,6 @@ func Test1Restart_duringStop(t *testing.T) {
 	})
 }
 
-func Test1Restart_attachPid(t *testing.T) {
-	// Assert it does not work and returns error.
-	// We cannot restart a process we did not spawn.
-	server := rpccommon.NewServer(&service.Config{
-		Listener:  nil,
-		AttachPid: 999,
-		Backend:   testBackend,
-	})
-	if err := server.Restart(); err == nil {
-		t.Fatal("expected error on restart after attaching to pid but got none")
-	}
-}
-
 func Test1ClientServer_exit(t *testing.T) {
 	withTestClient1("continuetestprog", t, func(c *rpc1.RPCClient) {
 		state, err := c.GetState()
@@ -253,7 +240,7 @@ func Test1NextGeneral(t *testing.T) {
 
 	ver, _ := goversion.Parse(runtime.Version())
 
-	if ver.Major < 0 || ver.AfterOrEqual(goversion.GoVersion{1, 7, -1, 0, 0, ""}) {
+	if ver.Major < 0 || ver.AfterOrEqual(goversion.GoVersion{Major: 1, Minor: 7, Rev: -1}) {
 		testcases = []nextTest{
 			{17, 19},
 			{19, 20},
@@ -433,7 +420,7 @@ func Test1ClientServer_infoLocals(t *testing.T) {
 		if state.Err != nil {
 			t.Fatalf("Unexpected error: %v, state: %#v", state.Err, state)
 		}
-		locals, err := c.ListLocalVariables(api.EvalScope{-1, 0, 0})
+		locals, err := c.ListLocalVariables(api.EvalScope{GoroutineID: -1})
 		if err != nil {
 			t.Fatalf("Unexpected error: %v", err)
 		}
@@ -461,7 +448,7 @@ func Test1ClientServer_infoArgs(t *testing.T) {
 		if regs == "" {
 			t.Fatal("Expected string showing registers values, got empty string")
 		}
-		locals, err := c.ListFunctionArgs(api.EvalScope{-1, 0, 0})
+		locals, err := c.ListFunctionArgs(api.EvalScope{GoroutineID: -1})
 		if err != nil {
 			t.Fatalf("Unexpected error: %v", err)
 		}
@@ -687,7 +674,7 @@ func Test1ClientServer_EvalVariable(t *testing.T) {
 			t.Fatalf("Continue(): %v\n", state.Err)
 		}
 
-		var1, err := c.EvalVariable(api.EvalScope{-1, 0, 0}, "a1")
+		var1, err := c.EvalVariable(api.EvalScope{GoroutineID: -1}, "a1")
 		assertNoError(err, t, "EvalVariable")
 
 		t.Logf("var1: %s", var1.SinglelineString())
@@ -706,9 +693,9 @@ func Test1ClientServer_SetVariable(t *testing.T) {
 			t.Fatalf("Continue(): %v\n", state.Err)
 		}
 
-		assertNoError(c.SetVariable(api.EvalScope{-1, 0, 0}, "a2", "8"), t, "SetVariable()")
+		assertNoError(c.SetVariable(api.EvalScope{GoroutineID: -1}, "a2", "8"), t, "SetVariable()")
 
-		a2, err := c.EvalVariable(api.EvalScope{-1, 0, 0}, "a2")
+		a2, err := c.EvalVariable(api.EvalScope{GoroutineID: -1}, "a2")
 		if err != nil {
 			t.Fatalf("Could not evaluate variable: %v", err)
 		}
@@ -724,9 +711,6 @@ func Test1ClientServer_SetVariable(t *testing.T) {
 }
 
 func Test1ClientServer_FullStacktrace(t *testing.T) {
-	if runtime.GOARCH == "arm64" {
-		t.Skip("arm64 does not support Stacktrace for now")
-	}
 	withTestClient1("goroutinestackprog", t, func(c *rpc1.RPCClient) {
 		_, err := c.CreateBreakpoint(&api.Breakpoint{FunctionName: "main.stacktraceme", Line: -1})
 		assertNoError(err, t, "CreateBreakpoint()")
@@ -799,9 +783,6 @@ func Test1ClientServer_FullStacktrace(t *testing.T) {
 }
 
 func Test1Issue355(t *testing.T) {
-	if runtime.GOARCH == "arm64" {
-		t.Skip("arm64 does not support Stacktrace for now")
-	}
 	// After the target process has terminated should return an error but not crash
 	withTestClient1("continuetestprog", t, func(c *rpc1.RPCClient) {
 		bp, err := c.CreateBreakpoint(&api.Breakpoint{FunctionName: "main.sayhi", Line: -1})
@@ -841,10 +822,10 @@ func Test1Issue355(t *testing.T) {
 		assertError(err, t, "ListThreads()")
 		_, err = c.GetThread(tid)
 		assertError(err, t, "GetThread()")
-		assertError(c.SetVariable(api.EvalScope{gid, 0, 0}, "a", "10"), t, "SetVariable()")
-		_, err = c.ListLocalVariables(api.EvalScope{gid, 0, 0})
+		assertError(c.SetVariable(api.EvalScope{GoroutineID: gid}, "a", "10"), t, "SetVariable()")
+		_, err = c.ListLocalVariables(api.EvalScope{GoroutineID: gid})
 		assertError(err, t, "ListLocalVariables()")
-		_, err = c.ListFunctionArgs(api.EvalScope{gid, 0, 0})
+		_, err = c.ListFunctionArgs(api.EvalScope{GoroutineID: gid})
 		assertError(err, t, "ListFunctionArgs()")
 		_, err = c.ListRegisters()
 		assertError(err, t, "ListRegisters()")
@@ -852,9 +833,9 @@ func Test1Issue355(t *testing.T) {
 		assertError(err, t, "ListGoroutines()")
 		_, err = c.Stacktrace(gid, 10, false)
 		assertError(err, t, "Stacktrace()")
-		_, err = c.FindLocation(api.EvalScope{gid, 0, 0}, "+1")
+		_, err = c.FindLocation(api.EvalScope{GoroutineID: gid}, "+1")
 		assertError(err, t, "FindLocation()")
-		_, err = c.DisassemblePC(api.EvalScope{-1, 0, 0}, 0x40100, api.IntelFlavour)
+		_, err = c.DisassemblePC(api.EvalScope{GoroutineID: -1}, 0x40100, api.IntelFlavour)
 		assertError(err, t, "DisassemblePC()")
 	})
 }
@@ -869,12 +850,12 @@ func Test1Disasm(t *testing.T) {
 		state := <-ch
 		assertNoError(state.Err, t, "Continue()")
 
-		locs, err := c.FindLocation(api.EvalScope{-1, 0, 0}, "main.main")
+		locs, err := c.FindLocation(api.EvalScope{GoroutineID: -1}, "main.main")
 		assertNoError(err, t, "FindLocation()")
 		if len(locs) != 1 {
 			t.Fatalf("wrong number of locations for main.main: %d", len(locs))
 		}
-		d1, err := c.DisassemblePC(api.EvalScope{-1, 0, 0}, locs[0].PC, api.IntelFlavour)
+		d1, err := c.DisassemblePC(api.EvalScope{GoroutineID: -1}, locs[0].PC, api.IntelFlavour)
 		assertNoError(err, t, "DisassemblePC()")
 		if len(d1) < 2 {
 			t.Fatalf("wrong size of disassembly: %d", len(d1))
@@ -882,7 +863,7 @@ func Test1Disasm(t *testing.T) {
 
 		pcstart := d1[0].Loc.PC
 		pcend := d1[len(d1)-1].Loc.PC + uint64(len(d1[len(d1)-1].Bytes))
-		d2, err := c.DisassembleRange(api.EvalScope{-1, 0, 0}, pcstart, pcend, api.IntelFlavour)
+		d2, err := c.DisassembleRange(api.EvalScope{GoroutineID: -1}, pcstart, pcend, api.IntelFlavour)
 		assertNoError(err, t, "DisassembleRange()")
 
 		if len(d1) != len(d2) {
@@ -891,7 +872,7 @@ func Test1Disasm(t *testing.T) {
 			t.Fatal("mismatched length between disassemble pc and disassemble range")
 		}
 
-		d3, err := c.DisassemblePC(api.EvalScope{-1, 0, 0}, state.CurrentThread.PC, api.IntelFlavour)
+		d3, err := c.DisassemblePC(api.EvalScope{GoroutineID: -1}, state.CurrentThread.PC, api.IntelFlavour)
 		assertNoError(err, t, "DisassemblePC() - second call")
 
 		if len(d1) != len(d3) {
@@ -925,8 +906,13 @@ func Test1Disasm(t *testing.T) {
 			t.Fatal("PC instruction not found")
 		}
 
-		startinstr := getCurinstr(d3)
+		if runtime.GOARCH == "386" && buildMode == "pie" {
+			// Skip the rest of the test because on intel 386 with PIE build mode
+			// the compiler will insert calls to __x86.get_pc_thunk which do not have DIEs and we can't resolve.
+			return
+		}
 
+		startinstr := getCurinstr(d3)
 		count := 0
 		for {
 			if count > 20 {
@@ -935,7 +921,7 @@ func Test1Disasm(t *testing.T) {
 			state, err := c.StepInstruction()
 			assertNoError(err, t, fmt.Sprintf("StepInstruction() %d", count))
 
-			d3, err = c.DisassemblePC(api.EvalScope{-1, 0, 0}, state.CurrentThread.PC, api.IntelFlavour)
+			d3, err = c.DisassemblePC(api.EvalScope{GoroutineID: -1}, state.CurrentThread.PC, api.IntelFlavour)
 			assertNoError(err, t, fmt.Sprintf("StepInstruction() %d", count))
 
 			curinstr := getCurinstr(d3)
@@ -1001,7 +987,7 @@ func Test1ClientServer_CondBreakpoint(t *testing.T) {
 		state := <-c.Continue()
 		assertNoError(state.Err, t, "Continue()")
 
-		nvar, err := c.EvalVariable(api.EvalScope{-1, 0, 0}, "n")
+		nvar, err := c.EvalVariable(api.EvalScope{GoroutineID: -1}, "n")
 		assertNoError(err, t, "EvalVariable()")
 
 		if nvar.SinglelineString() != "7" {
@@ -1055,14 +1041,14 @@ func Test1TypesCommand(t *testing.T) {
 
 func Test1Issue406(t *testing.T) {
 	withTestClient1("issue406", t, func(c *rpc1.RPCClient) {
-		locs, err := c.FindLocation(api.EvalScope{-1, 0, 0}, "issue406.go:146")
+		locs, err := c.FindLocation(api.EvalScope{GoroutineID: -1}, "issue406.go:146")
 		assertNoError(err, t, "FindLocation()")
 		_, err = c.CreateBreakpoint(&api.Breakpoint{Addr: locs[0].PC})
 		assertNoError(err, t, "CreateBreakpoint()")
 		ch := c.Continue()
 		state := <-ch
 		assertNoError(state.Err, t, "Continue()")
-		v, err := c.EvalVariable(api.EvalScope{-1, 0, 0}, "cfgtree")
+		v, err := c.EvalVariable(api.EvalScope{GoroutineID: -1}, "cfgtree")
 		assertNoError(err, t, "EvalVariable()")
 		vs := v.MultilineString("")
 		t.Logf("cfgtree formats to: %s\n", vs)

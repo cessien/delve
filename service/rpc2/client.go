@@ -33,7 +33,7 @@ func NewClient(addr string) *RPCClient {
 
 func newFromRPCClient(client *rpc.Client) *RPCClient {
 	c := &RPCClient{client: client}
-	c.call("SetApiVersion", api.SetAPIVersionIn{2}, &api.SetAPIVersionOut{})
+	c.call("SetApiVersion", api.SetAPIVersionIn{APIVersion: 2}, &api.SetAPIVersionOut{})
 	return c
 }
 
@@ -92,6 +92,10 @@ func (c *RPCClient) Rewind() <-chan *api.DebuggerState {
 	return c.continueDir(api.Rewind)
 }
 
+func (c *RPCClient) DirectionCongruentContinue() <-chan *api.DebuggerState {
+	return c.continueDir(api.DirectionCongruentContinue)
+}
+
 func (c *RPCClient) continueDir(cmd string) <-chan *api.DebuggerState {
 	ch := make(chan *api.DebuggerState)
 	go func() {
@@ -136,15 +140,33 @@ func (c *RPCClient) Next() (*api.DebuggerState, error) {
 	return &out.State, err
 }
 
+func (c *RPCClient) ReverseNext() (*api.DebuggerState, error) {
+	var out CommandOut
+	err := c.call("Command", api.DebuggerCommand{Name: api.ReverseNext, ReturnInfoLoadConfig: c.retValLoadCfg}, &out)
+	return &out.State, err
+}
+
 func (c *RPCClient) Step() (*api.DebuggerState, error) {
 	var out CommandOut
 	err := c.call("Command", api.DebuggerCommand{Name: api.Step, ReturnInfoLoadConfig: c.retValLoadCfg}, &out)
 	return &out.State, err
 }
 
+func (c *RPCClient) ReverseStep() (*api.DebuggerState, error) {
+	var out CommandOut
+	err := c.call("Command", api.DebuggerCommand{Name: api.ReverseStep, ReturnInfoLoadConfig: c.retValLoadCfg}, &out)
+	return &out.State, err
+}
+
 func (c *RPCClient) StepOut() (*api.DebuggerState, error) {
 	var out CommandOut
 	err := c.call("Command", api.DebuggerCommand{Name: api.StepOut, ReturnInfoLoadConfig: c.retValLoadCfg}, &out)
+	return &out.State, err
+}
+
+func (c *RPCClient) ReverseStepOut() (*api.DebuggerState, error) {
+	var out CommandOut
+	err := c.call("Command", api.DebuggerCommand{Name: api.ReverseStepOut, ReturnInfoLoadConfig: c.retValLoadCfg}, &out)
 	return &out.State, err
 }
 
@@ -292,9 +314,15 @@ func (c *RPCClient) ListLocalVariables(scope api.EvalScope, cfg api.LoadConfig) 
 	return out.Variables, err
 }
 
-func (c *RPCClient) ListRegisters(threadID int, includeFp bool) (api.Registers, error) {
+func (c *RPCClient) ListThreadRegisters(threadID int, includeFp bool) (api.Registers, error) {
 	out := new(ListRegistersOut)
-	err := c.call("ListRegisters", ListRegistersIn{ThreadID: threadID, IncludeFp: includeFp}, out)
+	err := c.call("ListRegisters", ListRegistersIn{ThreadID: threadID, IncludeFp: includeFp, Scope: nil}, out)
+	return out.Regs, err
+}
+
+func (c *RPCClient) ListScopeRegisters(scope api.EvalScope, includeFp bool) (api.Registers, error) {
+	out := new(ListRegistersOut)
+	err := c.call("ListRegisters", ListRegistersIn{ThreadID: 0, IncludeFp: includeFp, Scope: &scope}, out)
 	return out.Regs, err
 }
 
@@ -411,6 +439,21 @@ func (c *RPCClient) ListDynamicLibraries() ([]api.Image, error) {
 	var out ListDynamicLibrariesOut
 	c.call("ListDynamicLibraries", ListDynamicLibrariesIn{}, &out)
 	return out.List, nil
+}
+
+func (c *RPCClient) ExamineMemory(address uintptr, count int) ([]byte, error) {
+	out := &ExaminedMemoryOut{}
+
+	err := c.call("ExamineMemory", ExamineMemoryIn{Length: count, Address: address}, out)
+	if err != nil {
+		return nil, err
+	}
+
+	return out.Mem, nil
+}
+
+func (c *RPCClient) StopRecording() error {
+	return c.call("StopRecording", StopRecordingIn{}, &StopRecordingOut{})
 }
 
 func (c *RPCClient) call(method string, args, reply interface{}) error {

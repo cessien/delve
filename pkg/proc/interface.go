@@ -18,18 +18,31 @@ type Process interface {
 	RecordingManipulation
 }
 
-// RecordingManipulation is an interface for manipulating process recordings.
-type RecordingManipulation interface {
-	// Recorded returns true if the current process is a recording and the path
-	// to the trace directory.
-	Recorded() (recorded bool, tracedir string)
+// ProcessInternal holds a set of methods that are not meant to be called by
+// anyone except for an instance of `proc.Target`. These methods are not
+// safe to use by themselves and should never be called directly outside of
+// the `proc` package.
+// This is temporary and in support of an ongoing refactor.
+type ProcessInternal interface {
+	SetCurrentThread(Thread)
 	// Restart restarts the recording from the specified position, or from the
 	// last checkpoint if pos == "".
 	// If pos starts with 'c' it's a checkpoint ID, otherwise it's an event
 	// number.
 	Restart(pos string) error
+	Detach(bool) error
+	ContinueOnce() (trapthread Thread, stopReason StopReason, err error)
+}
+
+// RecordingManipulation is an interface for manipulating process recordings.
+type RecordingManipulation interface {
+	// Recorded returns true if the current process is a recording and the path
+	// to the trace directory.
+	Recorded() (recorded bool, tracedir string)
 	// Direction changes execution direction.
-	Direction(Direction) error
+	ChangeDirection(Direction) error
+	// GetDirection returns the current direction of execution.
+	GetDirection() Direction
 	// When returns current recording position.
 	When() (string, error)
 	// Checkpoint sets a checkpoint at the current position.
@@ -65,15 +78,12 @@ type Info interface {
 	ResumeNotify(chan<- struct{})
 	// Valid returns true if this Process can be used. When it returns false it
 	// also returns an error describing why the Process is invalid (either
-	// ErrProcessExited or ProcessDetachedError).
+	// ErrProcessExited or ErrProcessDetached).
 	Valid() (bool, error)
 	BinInfo() *BinaryInfo
 	EntryPoint() (uint64, error)
-	// Common returns a struct with fields common to all backends
-	Common() *CommonProcess
 
 	ThreadInfo
-	GoroutineInfo
 }
 
 // ThreadInfo is an interface for getting information on active threads
@@ -84,23 +94,12 @@ type ThreadInfo interface {
 	CurrentThread() Thread
 }
 
-// GoroutineInfo is an interface for getting information on running goroutines.
-type GoroutineInfo interface {
-	SelectedGoroutine() *G
-	SetSelectedGoroutine(*G)
-}
-
 // ProcessManipulation is an interface for changing the execution state of a process.
 type ProcessManipulation interface {
-	ContinueOnce() (trapthread Thread, err error)
-	StepInstruction() error
-	SwitchThread(int) error
-	SwitchGoroutine(int) error
 	RequestManualStop() error
 	// CheckAndClearManualStopRequest returns true the first time it's called
 	// after a call to RequestManualStop.
 	CheckAndClearManualStopRequest() bool
-	Detach(bool) error
 }
 
 // BreakpointManipulation is an interface for managing breakpoints.
@@ -109,32 +108,4 @@ type BreakpointManipulation interface {
 	SetBreakpoint(addr uint64, kind BreakpointKind, cond ast.Expr) (*Breakpoint, error)
 	ClearBreakpoint(addr uint64) (*Breakpoint, error)
 	ClearInternalBreakpoints() error
-}
-
-// CommonProcess contains fields used by this package, common to all
-// implementations of the Process interface.
-type CommonProcess struct {
-	allGCache     []*G
-	fncallEnabled bool
-
-	fncallForG map[int]*callInjection
-}
-
-type callInjection struct {
-	// if continueCompleted is not nil it means we are in the process of
-	// executing an injected function call, see comments throughout
-	// pkg/proc/fncall.go for a description of how this works.
-	continueCompleted chan<- *G
-	continueRequest   <-chan continueRequest
-}
-
-// NewCommonProcess returns a struct with fields common across
-// all process implementations.
-func NewCommonProcess(fncallEnabled bool) CommonProcess {
-	return CommonProcess{fncallEnabled: fncallEnabled, fncallForG: make(map[int]*callInjection)}
-}
-
-// ClearAllGCache clears the cached contents of the cache for runtime.allgs.
-func (p *CommonProcess) ClearAllGCache() {
-	p.allGCache = nil
 }

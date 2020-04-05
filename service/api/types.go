@@ -13,12 +13,17 @@ import (
 
 // ErrNotExecutable is an error returned when trying
 // to debug a non-executable file.
-var ErrNotExecutable = proc.ErrNotExecutable
+var ErrNotExecutable = errors.New("not an executable file")
 
 // DebuggerState represents the current context of the debugger.
 type DebuggerState struct {
 	// Running is true if the process is running and no other information can be collected.
 	Running bool
+	// Recording is true if the process is currently being recorded and no other
+	// information can be collected. While the debugger is in this state
+	// sending a StopRecording request will halt the recording, every other
+	// request will block until the process has been recorded.
+	Recording bool
 	// CurrentThread is the currently selected debugger thread.
 	CurrentThread *Thread `json:"currentThread,omitempty"`
 	// SelectedGoroutine is the currently selected goroutine
@@ -207,7 +212,7 @@ const (
 	// that may outlive the stack frame are allocated on the heap instead and
 	// only the address is recorded on the stack. These variables will be
 	// marked with this flag.
-	VariableEscaped = (1 << iota)
+	VariableEscaped = 1 << iota
 
 	// VariableShadowed is set for local variables that are shadowed by a
 	// variable with the same name in another scope
@@ -308,6 +313,8 @@ type Goroutine struct {
 	// ID of the associated thread for running goroutines
 	ThreadID   int    `json:"threadID"`
 	Unreadable string `json:"unreadable"`
+	// Goroutine's pprof labels
+	Labels map[string]string `json:"labels,omitempty"`
 }
 
 // DebuggerCommand is a command which changes the debugger's execution state.
@@ -364,16 +371,24 @@ const (
 	Continue = "continue"
 	// Rewind resumes process execution backwards (target must be a recording).
 	Rewind = "rewind"
+	// DirecitonCongruentContinue resumes process execution, if a reverse next, step or stepout operation is in progress it will resume execution backward.
+	DirectionCongruentContinue = "directionCongruentContinue"
 	// Step continues to next source line, entering function calls.
 	Step = "step"
+	// ReverseStep continues backward to the previous line of source code, entering function calls.
+	ReverseStep = "reverseStep"
 	// StepOut continues to the return address of the current function
 	StepOut = "stepOut"
+	// ReverseStepOut continues backward to the calle rof the current function.
+	ReverseStepOut = "reverseStepOut"
 	// StepInstruction continues for exactly 1 cpu instruction.
 	StepInstruction = "stepInstruction"
 	// ReverseStepInstruction reverses execution for exactly 1 cpu instruction.
 	ReverseStepInstruction = "reverseStepInstruction"
 	// Next continues to the next source line, not entering function calls.
 	Next = "next"
+	// ReverseNext continues backward to the previous line of source code, not entering function calls.
+	ReverseNext = "reverseNext"
 	// SwitchThread switches the debugger's current thread context.
 	SwitchThread = "switchThread"
 	// SwitchGoroutine switches the debugger's current thread context to the thread running the specified goroutine
@@ -440,8 +455,9 @@ type SetAPIVersionOut struct {
 
 // Register holds information on a CPU register.
 type Register struct {
-	Name  string
-	Value string
+	Name        string
+	Value       string
+	DwarfNumber int
 }
 
 // Registers is a list of CPU registers.
@@ -509,3 +525,10 @@ const (
 	// values saved in the runtime.g structure.
 	StacktraceG
 )
+
+// ImportPathToDirectoryPath maps an import path to a directory path.
+type PackageBuildInfo struct {
+	ImportPath    string
+	DirectoryPath string
+	Files         []string
+}
