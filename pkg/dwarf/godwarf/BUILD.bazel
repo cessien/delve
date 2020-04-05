@@ -1,0 +1,15 @@
+load("@io_bazel_rules_go//go:def.bzl", "go_library")
+
+go_library(
+    name = "go_default_library",
+    srcs = [
+        "sections.go",
+        "type.go",
+    ],
+    importpath = "github.com/go-delve/delve/pkg/dwarf/godwarf",
+    visibility = ["//visibility:public"],
+    deps = [
+        "//pkg/dwarf/op:go_default_library",
+        "//pkg/dwarf/util:go_default_library",
+    ],
+)

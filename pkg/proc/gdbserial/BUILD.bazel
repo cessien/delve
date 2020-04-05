@@ -1,0 +1,33 @@
+load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "go_default_library",
+    srcs = [
+        "gdbserver.go",
+        "gdbserver_conn.go",
+        "gdbserver_unix.go",
+        "gdbserver_windows.go",
+        "rr.go",
+    ],
+    importpath = "github.com/go-delve/delve/pkg/proc/gdbserial",
+    visibility = ["//visibility:public"],
+    deps = [
+        "//pkg/logflags:go_default_library",
+        "//pkg/proc:go_default_library",
+        "//pkg/proc/linutil:go_default_library",
+        "//vendor/github.com/mattn/go-isatty:go_default_library",
+        "//vendor/github.com/sirupsen/logrus:go_default_library",
+        "//vendor/golang.org/x/arch/x86/x86asm:go_default_library",
+    ],
+)
+
+go_test(
+    name = "go_default_test",
+    srcs = ["rr_test.go"],
+    embed = [":go_default_library"],
+    deps = [
+        "//pkg/logflags:go_default_library",
+        "//pkg/proc:go_default_library",
+        "//pkg/proc/test:go_default_library",
+    ],
+)

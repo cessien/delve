@@ -1,0 +1,141 @@
+load("@io_bazel_rules_go//go:def.bzl", "go_library")
+
+go_library(
+    name = "go_default_library",
+    srcs = [
+        "exc.h",
+        "mach_exc.h",
+        "nonative_darwin.go",
+        "proc.go",
+        "proc_freebsd.c",
+        "proc_freebsd.go",
+        "proc_freebsd.h",
+        "proc_linux.go",
+        "proc_windows.go",
+        "ptrace_freebsd.go",
+        "ptrace_freebsd_amd64.c",
+        "ptrace_freebsd_amd64.h",
+        "ptrace_linux.go",
+        "ptrace_linux_amd64.go",
+        "registers_freebsd_amd64.go",
+        "registers_linux_amd64.go",
+        "registers_linux_arm64.go",
+        "registers_windows_amd64.go",
+        "syscall_windows.go",
+        "syscall_windows_amd64.go",
+        "threads.go",
+        "threads_freebsd.go",
+        "threads_linux.go",
+        "threads_linux_amd64.go",
+        "threads_linux_arm64.go",
+        "threads_windows.go",
+        "zsyscall_windows.go",
+    ],
+    cgo = True,
+    clinkopts = select({
+        "@io_bazel_rules_go//go/platform:freebsd": [
+            "-lprocstat",
+            "-lutil",
+        ],
+        "//conditions:default": [],
+    }),
+    importpath = "github.com/go-delve/delve/pkg/proc/native",
+    visibility = ["//visibility:public"],
+    deps = [
+        "//pkg/proc:go_default_library",
+    ] + select({
+        "@io_bazel_rules_go//go/platform:android": [
+            "//vendor/github.com/mattn/go-isatty:go_default_library",
+        ],
+        "@io_bazel_rules_go//go/platform:freebsd": [
+            "//vendor/github.com/mattn/go-isatty:go_default_library",
+        ],
+        "@io_bazel_rules_go//go/platform:linux": [
+            "//vendor/github.com/mattn/go-isatty:go_default_library",
+        ],
+        "@io_bazel_rules_go//go/platform:windows": [
+            "//vendor/golang.org/x/sys/windows:go_default_library",
+        ],
+        "//conditions:default": [],
+    }) + select({
+        "@io_bazel_rules_go//go/platform:android_386": [
+            "//pkg/proc/linutil:go_default_library",
+            "//vendor/golang.org/x/sys/unix:go_default_library",
+        ],
+        "@io_bazel_rules_go//go/platform:android_amd64": [
+            "//pkg/proc/linutil:go_default_library",
+            "//vendor/golang.org/x/sys/unix:go_default_library",
+        ],
+        "@io_bazel_rules_go//go/platform:android_arm": [
+            "//pkg/proc/linutil:go_default_library",
+            "//vendor/golang.org/x/sys/unix:go_default_library",
+        ],
+        "@io_bazel_rules_go//go/platform:android_arm64": [
+            "//pkg/proc/linutil:go_default_library",
+            "//vendor/golang.org/x/sys/unix:go_default_library",
+        ],
+        "@io_bazel_rules_go//go/platform:freebsd_386": [
+            "//pkg/proc/fbsdutil:go_default_library",
+            "//vendor/golang.org/x/sys/unix:go_default_library",
+        ],
+        "@io_bazel_rules_go//go/platform:freebsd_amd64": [
+            "//pkg/proc/fbsdutil:go_default_library",
+            "//vendor/golang.org/x/sys/unix:go_default_library",
+        ],
+        "@io_bazel_rules_go//go/platform:freebsd_arm": [
+            "//pkg/proc/fbsdutil:go_default_library",
+            "//vendor/golang.org/x/sys/unix:go_default_library",
+        ],
+        "@io_bazel_rules_go//go/platform:linux_386": [
+            "//pkg/proc/linutil:go_default_library",
+            "//vendor/golang.org/x/sys/unix:go_default_library",
+        ],
+        "@io_bazel_rules_go//go/platform:linux_amd64": [
+            "//pkg/proc/linutil:go_default_library",
+            "//vendor/golang.org/x/sys/unix:go_default_library",
+        ],
+        "@io_bazel_rules_go//go/platform:linux_arm": [
+            "//pkg/proc/linutil:go_default_library",
+            "//vendor/golang.org/x/sys/unix:go_default_library",
+        ],
+        "@io_bazel_rules_go//go/platform:linux_arm64": [
+            "//pkg/proc/linutil:go_default_library",
+            "//vendor/golang.org/x/sys/unix:go_default_library",
+        ],
+        "@io_bazel_rules_go//go/platform:linux_mips": [
+            "//pkg/proc/linutil:go_default_library",
+            "//vendor/golang.org/x/sys/unix:go_default_library",
+        ],
+        "@io_bazel_rules_go//go/platform:linux_mips64": [
+            "//pkg/proc/linutil:go_default_library",
+            "//vendor/golang.org/x/sys/unix:go_default_library",
+        ],
+        "@io_bazel_rules_go//go/platform:linux_mips64le": [
+            "//pkg/proc/linutil:go_default_library",
+            "//vendor/golang.org/x/sys/unix:go_default_library",
+        ],
+        "@io_bazel_rules_go//go/platform:linux_mipsle": [
+            "//pkg/proc/linutil:go_default_library",
+            "//vendor/golang.org/x/sys/unix:go_default_library",
+        ],
+        "@io_bazel_rules_go//go/platform:linux_ppc64": [
+            "//pkg/proc/linutil:go_default_library",
+            "//vendor/golang.org/x/sys/unix:go_default_library",
+        ],
+        "@io_bazel_rules_go//go/platform:linux_ppc64le": [
+            "//pkg/proc/linutil:go_default_library",
+            "//vendor/golang.org/x/sys/unix:go_default_library",
+        ],
+        "@io_bazel_rules_go//go/platform:linux_s390x": [
+            "//pkg/proc/linutil:go_default_library",
+            "//vendor/golang.org/x/sys/unix:go_default_library",
+        ],
+        "@io_bazel_rules_go//go/platform:windows_386": [
+            "//pkg/proc/winutil:go_default_library",
+        ],
+        "@io_bazel_rules_go//go/platform:windows_amd64": [
+            "//pkg/proc/winutil:go_default_library",
+        ],
+        "//conditions:default": [],
+    }),
+)

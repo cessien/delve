@@ -1,0 +1,51 @@
+load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "go_default_library",
+    srcs = [
+        "command.go",
+        "config.go",
+        "disasmprint.go",
+        "docgen.go",
+        "starlark.go",
+        "terminal.go",
+        "terminal_other.go",
+        "terminal_windows.go",
+    ],
+    importpath = "github.com/go-delve/delve/pkg/terminal",
+    visibility = ["//visibility:public"],
+    deps = [
+        "//pkg/config:go_default_library",
+        "//pkg/terminal/starbind:go_default_library",
+        "//service:go_default_library",
+        "//service/api:go_default_library",
+        "//service/debugger:go_default_library",
+        "//vendor/github.com/cosiner/argv:go_default_library",
+        "//vendor/github.com/peterh/liner:go_default_library",
+    ] + select({
+        "@io_bazel_rules_go//go/platform:windows": [
+            "//vendor/github.com/mattn/go-colorable:go_default_library",
+        ],
+        "//conditions:default": [],
+    }),
+)
+
+go_test(
+    name = "go_default_test",
+    srcs = [
+        "command_test.go",
+        "starlark_test.go",
+        "terminal_test.go",
+    ],
+    embed = [":go_default_library"],
+    deps = [
+        "//pkg/config:go_default_library",
+        "//pkg/goversion:go_default_library",
+        "//pkg/logflags:go_default_library",
+        "//pkg/proc/test:go_default_library",
+        "//service:go_default_library",
+        "//service/api:go_default_library",
+        "//service/rpc2:go_default_library",
+        "//service/rpccommon:go_default_library",
+    ],
+)

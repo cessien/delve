@@ -1,0 +1,20 @@
+load("@io_bazel_rules_go//go:def.bzl", "go_library")
+
+go_library(
+    name = "go_default_library",
+    srcs = ["commands.go"],
+    importpath = "github.com/go-delve/delve/cmd/dlv/cmds",
+    visibility = ["//visibility:public"],
+    deps = [
+        "//pkg/config:go_default_library",
+        "//pkg/goversion:go_default_library",
+        "//pkg/logflags:go_default_library",
+        "//pkg/terminal:go_default_library",
+        "//pkg/version:go_default_library",
+        "//service:go_default_library",
+        "//service/api:go_default_library",
+        "//service/rpc2:go_default_library",
+        "//service/rpccommon:go_default_library",
+        "//vendor/github.com/spf13/cobra:go_default_library",
+    ],
+)

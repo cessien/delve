@@ -1,0 +1,22 @@
+load("@io_bazel_rules_go//go:def.bzl", "go_binary", "go_library")
+
+go_library(
+    name = "go_default_library",
+    srcs = [
+        "gen-opcodes.go",
+        "gen-starlark-bindings.go",
+        "make.go",
+    ],
+    importpath = "github.com/go-delve/delve/scripts",
+    visibility = ["//visibility:private"],
+    deps = [
+        "//vendor/github.com/spf13/cobra:go_default_library",
+        "//vendor/golang.org/x/tools/go/packages:go_default_library",
+    ],
+)
+
+go_binary(
+    name = "scripts",
+    embed = [":go_default_library"],
+    visibility = ["//visibility:public"],
+)

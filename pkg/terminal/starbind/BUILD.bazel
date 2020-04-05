@@ -1,0 +1,22 @@
+load("@io_bazel_rules_go//go:def.bzl", "go_library")
+
+go_library(
+    name = "go_default_library",
+    srcs = [
+        "conv.go",
+        "repl.go",
+        "starlark.go",
+        "starlark_mapping.go",
+    ],
+    importpath = "github.com/go-delve/delve/pkg/terminal/starbind",
+    visibility = ["//visibility:public"],
+    deps = [
+        "//service:go_default_library",
+        "//service/api:go_default_library",
+        "//service/rpc2:go_default_library",
+        "//vendor/github.com/peterh/liner:go_default_library",
+        "//vendor/go.starlark.net/resolve:go_default_library",
+        "//vendor/go.starlark.net/starlark:go_default_library",
+        "//vendor/go.starlark.net/syntax:go_default_library",
+    ],
+)

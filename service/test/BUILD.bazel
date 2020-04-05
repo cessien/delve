@@ -1,0 +1,24 @@
+load("@io_bazel_rules_go//go:def.bzl", "go_test")
+
+go_test(
+    name = "go_default_test",
+    srcs = [
+        "common_test.go",
+        "integration1_test.go",
+        "integration2_test.go",
+        "variables_test.go",
+    ],
+    deps = [
+        "//pkg/goversion:go_default_library",
+        "//pkg/logflags:go_default_library",
+        "//pkg/proc:go_default_library",
+        "//pkg/proc/gdbserial:go_default_library",
+        "//pkg/proc/native:go_default_library",
+        "//pkg/proc/test:go_default_library",
+        "//service:go_default_library",
+        "//service/api:go_default_library",
+        "//service/rpc1:go_default_library",
+        "//service/rpc2:go_default_library",
+        "//service/rpccommon:go_default_library",
+    ],
+)

@@ -1,0 +1,16 @@
+load("@io_bazel_rules_go//go:def.bzl", "go_library")
+
+go_library(
+    name = "go_default_library",
+    srcs = [
+        "conversions.go",
+        "prettyprint.go",
+        "types.go",
+    ],
+    importpath = "github.com/go-delve/delve/service/api",
+    visibility = ["//visibility:public"],
+    deps = [
+        "//pkg/dwarf/godwarf:go_default_library",
+        "//pkg/proc:go_default_library",
+    ],
+)

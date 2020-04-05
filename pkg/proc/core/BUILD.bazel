@@ -1,0 +1,30 @@
+load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "go_default_library",
+    srcs = [
+        "core.go",
+        "linux_amd64_core.go",
+        "windows_amd64_minidump.go",
+    ],
+    importpath = "github.com/go-delve/delve/pkg/proc/core",
+    visibility = ["//visibility:public"],
+    deps = [
+        "//pkg/logflags:go_default_library",
+        "//pkg/proc:go_default_library",
+        "//pkg/proc/core/minidump:go_default_library",
+        "//pkg/proc/linutil:go_default_library",
+        "//pkg/proc/winutil:go_default_library",
+    ],
+)
+
+go_test(
+    name = "go_default_test",
+    srcs = ["core_test.go"],
+    embed = [":go_default_library"],
+    deps = [
+        "//pkg/goversion:go_default_library",
+        "//pkg/proc:go_default_library",
+        "//pkg/proc/test:go_default_library",
+    ],
+)

@@ -1,0 +1,25 @@
+load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "go_default_library",
+    srcs = [
+        "entries.go",
+        "expression_constants.go",
+        "parser.go",
+        "table.go",
+    ],
+    importpath = "github.com/go-delve/delve/pkg/dwarf/frame",
+    visibility = ["//visibility:public"],
+    deps = ["//pkg/dwarf/util:go_default_library"],
+)
+
+go_test(
+    name = "go_default_test",
+    srcs = [
+        "entries_test.go",
+        "parser_test.go",
+    ],
+    data = glob(["testdata/**"]),
+    embed = [":go_default_library"],
+    deps = ["//vendor/github.com/pkg/profile:go_default_library"],
+)

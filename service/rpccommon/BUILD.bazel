@@ -1,0 +1,28 @@
+load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "go_default_library",
+    srcs = [
+        "sameuser.go",
+        "sameuser_linux.go",
+        "server.go",
+    ],
+    importpath = "github.com/go-delve/delve/service/rpccommon",
+    visibility = ["//visibility:public"],
+    deps = [
+        "//pkg/logflags:go_default_library",
+        "//pkg/version:go_default_library",
+        "//service:go_default_library",
+        "//service/api:go_default_library",
+        "//service/debugger:go_default_library",
+        "//service/rpc1:go_default_library",
+        "//service/rpc2:go_default_library",
+        "//vendor/github.com/sirupsen/logrus:go_default_library",
+    ],
+)
+
+go_test(
+    name = "go_default_test",
+    srcs = ["sameuser_linux_test.go"],
+    embed = [":go_default_library"],
+)
